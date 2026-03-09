@@ -1,5 +1,6 @@
 #include "application.h"
 #include "board.h"
+#include "device_state.h"
 #include "display.h"
 #include "system_info.h"
 #include "audio_codec.h"
@@ -496,8 +497,9 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (GetDeviceState() == kDeviceStateSpeaking || has_start_intercom_) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            ESP_LOGI(TAG, "OnIncomingAudio");
         }
     });
     
@@ -519,6 +521,8 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
+        // 打印完整 JSON 数据
+        ESP_LOGI(TAG, "Received JSON: %s", cJSON_PrintUnformatted(root));
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {
@@ -601,6 +605,25 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        }else if (strcmp(type->valuestring, "intercom") == 0) {
+            auto command = cJSON_GetObjectItem(root, "command");
+            if (cJSON_IsString(command)) {
+                ESP_LOGI(TAG, "System command: %s", command->valuestring);
+                if (strcmp(command->valuestring, "start") == 0) {
+                    has_start_intercom_ = true;
+                    ESP_LOGI(TAG, "intercom:start");
+                    Schedule([this]() {
+                        if (GetDeviceState() != kDeviceStateListening) {
+                            SetDeviceState(kDeviceStateListening);
+                        }
+                    });
+                } else if (strcmp(command->valuestring, "stop") == 0) { 
+                    has_start_intercom_ = false;
+                }else { 
+                    ESP_LOGW(TAG, "intercom error command: %s", command->valuestring);
+                }
+
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }

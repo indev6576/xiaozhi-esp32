@@ -13,7 +13,7 @@
 
 #include "application.h"
 #include "button.h"
-#include "codecs/es8311_audio_codec.h"
+#include "codecs/es8312_audio_codec.h"
 #include "config.h"
 #include "sleep_timer.h"
 #include "wifi_board.h"
@@ -386,7 +386,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static Es8311AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static Es8312AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
                                             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
                                             AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
                                             AUDIO_CODEC_ES8311_ADDR, false);

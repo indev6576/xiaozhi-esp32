@@ -142,6 +142,7 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    bool has_start_intercom_ = false;
 
 
     // Event handlers
