@@ -73,6 +73,10 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    Schedule([this]() {
+        // Play the success sound to indicate the device is ready
+        audio_service_.PlaySound(Lang::Sounds::OGG_VIBRATION);
+    });
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
@@ -523,7 +527,7 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // 打印完整 JSON 数据
-        ESP_LOGI(TAG, "Received JSON: %s", cJSON_PrintUnformatted(root));
+        // ESP_LOGI(TAG, "Received JSON: %s", cJSON_PrintUnformatted(root));
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {

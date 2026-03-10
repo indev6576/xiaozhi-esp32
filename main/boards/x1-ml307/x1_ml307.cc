@@ -42,7 +42,7 @@ private:
     void InitializeGPIO() {
         gpio_config_t io_conf_1 = {.pin_bit_mask = (1ULL << MCU_VCC_CTL),
                                    .mode = GPIO_MODE_OUTPUT,
-                                   .pull_up_en = GPIO_PULLUP_ENABLE,
+                                   .pull_up_en = GPIO_PULLUP_DISABLE,
                                    .pull_down_en = GPIO_PULLDOWN_DISABLE,
                                    .intr_type = GPIO_INTR_DISABLE};
         gpio_config(&io_conf_1);
@@ -52,7 +52,7 @@ private:
 
     void SwithOnOff(bool onOff) {
         gpio_set_level(MCU_VCC_CTL, onOff);
-        gpio_hold_en(MCU_VCC_CTL);
+        // gpio_hold_en(MCU_VCC_CTL);
         ESP_LOGI(TAG, "SwithOnOff: %d", onOff);
         ESP_LOGI(TAG, "MCU_VCC_CTL: %d", gpio_get_level(MCU_VCC_CTL));
     }
@@ -70,7 +70,7 @@ private:
 
 
 public:
-    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO){
+    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true){
 
         InitializeCodecI2c();
         InitializeGPIO();
