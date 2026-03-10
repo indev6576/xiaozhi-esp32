@@ -319,6 +319,7 @@ void Application::HandleActivationDoneEvent() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     });
+    ToggleChatState();
 }
 
 void Application::ActivationTask() {
@@ -499,7 +500,7 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking || has_start_intercom_) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
-            ESP_LOGI(TAG, "OnIncomingAudio");
+            // ESP_LOGI(TAG, "OnIncomingAudio");
         }
     });
     
