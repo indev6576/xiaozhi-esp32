@@ -66,6 +66,12 @@ private:
             SwithOnOff(false);
             ESP_LOGI(TAG, "Boot button long pressed");
         });
+        boot_button_.OnDoubleClick([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+                SwitchNetworkType();
+            }
+        });
     }
 
 
