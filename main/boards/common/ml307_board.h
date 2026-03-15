@@ -4,6 +4,7 @@
 #include <memory>
 #include <at_modem.h>
 #include "board.h"
+#include "wifi_board.h"
 
 
 class Ml307Board : public Board {
@@ -13,6 +14,11 @@ protected:
     gpio_num_t rx_pin_;
     gpio_num_t dtr_pin_;
     NetworkEventCallback network_event_callback_;
+
+#if CONFIG_USE_CSI_RADAR
+    // WifiBoard instance for CSI Radar functionality
+    WifiBoard wifi_board_;
+#endif
 
     virtual std::string GetBoardJson() override;
 

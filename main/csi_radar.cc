@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <esp_event.h>
 #include <string.h>
 #include <math.h>
 
@@ -110,9 +111,18 @@ bool CsiRadar::Start() {
 
     dec_config.wifi_radar_cb = RadarCallbackImpl;
 
-    err = esp_radar_wifi_init(&wifi_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init wifi radar: %d", err);
+    // Ensure event loop exists before calling esp_radar_wifi_init
+    // This handles the case where WifiManager already created the event loop
+    esp_err_t loop_err = esp_event_loop_create_default();
+    if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to create event loop: %d", loop_err);
+        return false;
+    }
+    ESP_LOGI(TAG, "Event loop ready");
+
+    esp_err_t radar_err = esp_radar_wifi_init(&wifi_config);
+    if (radar_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init wifi radar: %d", radar_err);
         return false;
     }
 
