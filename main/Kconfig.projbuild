@@ -779,8 +779,10 @@ config USE_CSI_RADAR
     bool "Enable CSI Radar (Human Detection)"
     default y
     depends on ESP_WIFI_ENABLED
+    select ESP_WIFI_CSI_ENABLED
     help
         Enable Wi-Fi CSI radar for human detection using Channel State Information
+        This will automatically enable ESP_WIFI_CSI_ENABLED in esp-idf config
 
 menu "WiFi Configuration Method"
     help
