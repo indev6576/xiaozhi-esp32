@@ -145,12 +145,8 @@ void Application::Initialize() {
                 msg += data;
                 display->ShowNotification(msg.c_str(), 30000);
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
-
-#if CONFIG_USE_CSI_RADAR
-                if (!csi_radar.Start()) {
-                    ESP_LOGE(TAG, "Failed to start CSI Radar");
-                }
-#endif
+                // Note: CSI Radar is started by WifiBoard when WiFi connects (see ml307_board.cc)
+                // For pure WiFi boards, CSI Radar is started after WiFi is connected
                 break;
             }
             case NetworkEvent::Disconnected:

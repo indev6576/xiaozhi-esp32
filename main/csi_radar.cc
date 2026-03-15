@@ -56,6 +56,13 @@ CsiRadar::~CsiRadar() {
     }
 }
 
+void CsiRadar::StartIfNeeded() {
+    if (instance_ && !s_initialized_) {
+        ESP_LOGI(TAG, "Starting CSI Radar via global function...");
+        instance_->Start();
+    }
+}
+
 bool CsiRadar::Start() {
     if (s_initialized_) {
         ESP_LOGW(TAG, "CSI Radar already initialized");
@@ -101,8 +108,27 @@ bool CsiRadar::Start() {
         ESP_LOGI(TAG, "WiFi already in STA mode, ready for CSI Radar");
     }
 
+    // Wait for WiFi to be ready (not scanning, not in config mode)
+    // This is needed because WifiBoard may be in config mode (AP + STA scanning)
+    wifi_ap_record_t ap_info;
+    int retry = 0;
+    const int max_retries = 20;
+    while (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK && retry < max_retries) {
+        retry++;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (retry >= max_retries) {
+        ESP_LOGW(TAG, "WiFi is in config mode or scanning, skipping CSI Radar for now");
+        // Return true to not block the rest of the application
+        // CSI Radar will be started when WiFi is properly connected
+        return true;
+    }
+    ESP_LOGI(TAG, "WiFi connected, starting CSI Radar...");
+
+    // Since WifiManager has already created the WiFi netif and started WiFi,
+    // we skip esp_radar_wifi_init which would fail with duplicate netif.
+    // Instead, we initialize CSI directly.
     esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
-    esp_radar_wifi_config_t wifi_config = ESP_RADAR_WIFI_CONFIG_DEFAULT();
     esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
 
     csi_config.csi_recv_interval = 50;
@@ -111,8 +137,7 @@ bool CsiRadar::Start() {
 
     dec_config.wifi_radar_cb = RadarCallbackImpl;
 
-    // Ensure event loop exists before calling esp_radar_wifi_init
-    // This handles the case where WifiManager already created the event loop
+    // Ensure event loop exists
     esp_err_t loop_err = esp_event_loop_create_default();
     if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to create event loop: %d", loop_err);
@@ -120,12 +145,8 @@ bool CsiRadar::Start() {
     }
     ESP_LOGI(TAG, "Event loop ready");
 
-    esp_err_t radar_err = esp_radar_wifi_init(&wifi_config);
-    if (radar_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init wifi radar: %d", radar_err);
-        return false;
-    }
-
+    // Skip esp_radar_wifi_init since WiFi is already configured by WifiManager
+    // Just initialize CSI directly
     err = esp_radar_csi_init(&csi_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init CSI: %d", err);

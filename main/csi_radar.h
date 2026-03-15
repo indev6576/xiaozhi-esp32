@@ -24,6 +24,12 @@ public:
 
     static CsiRadar* GetInstance() { return instance_; }
 
+    /**
+     * Global function to start CSI Radar if needed
+     * This can be called from other components (e.g., Ml307Board)
+     */
+    static void StartIfNeeded();
+
 private:
     static void RadarCallbackImpl(void* ctx, const wifi_radar_info_t* info);
 
