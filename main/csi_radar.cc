@@ -63,12 +63,27 @@ bool CsiRadar::Start() {
 
     wifi_mode_t mode;
     esp_err_t err = esp_wifi_get_mode(&mode);
+    
+    // Handle WiFi not initialized (error code 12289 = ESP_ERR_WIFI_NOT_INIT)
+    if (err == ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "WiFi not initialized, initializing now...");
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        err = esp_wifi_init(&cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to init WiFi: %d", err);
+            return false;
+        }
+        // Try to get mode again after initialization
+        err = esp_wifi_get_mode(&mode);
+    }
+    
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get WiFi mode: %d", err);
         return false;
     }
 
     if (mode != WIFI_MODE_STA) {
+        // If WiFi is in AP mode or not started, configure as STA
         esp_err_t err2 = esp_wifi_set_mode(WIFI_MODE_STA);
         if (err2 != ESP_OK) {
             ESP_LOGE(TAG, "Failed to set WiFi mode to STA: %d", err2);
@@ -80,6 +95,9 @@ bool CsiRadar::Start() {
             ESP_LOGE(TAG, "Failed to start WiFi: %d", err2);
             return false;
         }
+        ESP_LOGI(TAG, "WiFi initialized and started in STA mode for CSI Radar");
+    } else {
+        ESP_LOGI(TAG, "WiFi already in STA mode, ready for CSI Radar");
     }
 
     esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
