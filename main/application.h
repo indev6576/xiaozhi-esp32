@@ -108,10 +108,13 @@ public:
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
+    void SendMessage(const std::string& payload);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    bool GetInterComStatus() {return has_start_intercom_;};
+    void SetInterCom(bool start) {has_start_intercom_ = start;};
     
     /**
      * Reset protocol resources (thread-safe)

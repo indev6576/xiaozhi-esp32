@@ -59,8 +59,17 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
-            Application::GetInstance().ToggleChatState();
+            auto& app = Application::GetInstance();
             ESP_LOGI(TAG, "Boot button clicked");
+            if (app.GetInterComStatus())
+            {
+                app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"stop\",\"target\":\"1658\"}");
+                app.SetInterCom(false);
+            }
+            else {
+                Application::GetInstance().ToggleChatState();
+            }
+            
         });
         boot_button_.OnLongPress([this]() {
             SwithOnOff(false);
@@ -68,8 +77,13 @@ private:
         });
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
+            auto& board = Board::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
-                SwitchNetworkType();
+                this->SwitchNetworkType(); 
+            }
+            else { 
+                app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"start\",\"target\":\"1658\"}");
+                app.SetInterCom(true);
             }
         });
     }
