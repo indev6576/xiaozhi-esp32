@@ -21,6 +21,7 @@ class X1ML307Board : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
+    Button sensor_button_;
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -86,11 +87,22 @@ private:
                 app.SetInterCom(true);
             }
         });
+
+        sensor_button_.OnPressDown([this]() {
+            auto& app = Application::GetInstance();
+            app.SendMessage("{\"type\":\"sensor_dev2serv\",\"people_in\":\"yes\"}");
+            ESP_LOGI(TAG, "Sensor detect people in");
+        });
+        sensor_button_.OnPressUp([this]() {
+            auto& app = Application::GetInstance();
+            app.SendMessage("{\"type\":\"sensor_dev2serv\",\"people_in\":\"no\"}");
+            ESP_LOGI(TAG, "Sensor detect people out");
+        });
     }
 
 
 public:
-    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true){
+    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true), sensor_button_(SENSOR_BUTTON_GPIO, true){
 
         InitializeCodecI2c();
         InitializeGPIO();

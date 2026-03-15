@@ -20,6 +20,7 @@
 
 #define BUILTIN_LED_GPIO        GPIO_NUM_1
 #define BOOT_BUTTON_GPIO        GPIO_NUM_3
+#define SENSOR_BUTTON_GPIO      GPIO_NUM_8
 #define MCU_VCC_CTL             GPIO_NUM_2
 
 #define ML307_RX_PIN GPIO_NUM_44
