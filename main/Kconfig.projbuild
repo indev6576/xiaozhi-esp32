@@ -775,6 +775,13 @@ config USE_AUDIO_DEBUGGER
     help
         Enable audio debugger, send audio data through UDP to the host machine
 
+config USE_CSI_RADAR
+    bool "Enable CSI Radar (Human Detection)"
+    default y
+    depends on ESP_WIFI_ENABLED
+    help
+        Enable Wi-Fi CSI radar for human detection using Channel State Information
+
 menu "WiFi Configuration Method"
     help
         WiFi Configuration Method Selection

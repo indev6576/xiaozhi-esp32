@@ -38,6 +38,7 @@ set(SOURCES "audio/audio_codec.cc"
             "device_state_machine.cc"
             "assets.cc"
             "main.cc"
+            "csi_radar.cc"
             )
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
@@ -917,6 +918,9 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp-radar
+                        esp_radar_motion_dec
+                        esp_csi_gain_ctrl
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -928,6 +932,8 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-format")
 
 # Add generation rules
 add_custom_command(
