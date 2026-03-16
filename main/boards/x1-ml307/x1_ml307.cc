@@ -1,6 +1,8 @@
 #include "dual_network_board.h"
 #include "codecs/es8312_audio_codec.h"
 #include "display/oled_display.h"
+#include "freertos/idf_additions.h"
+#include "protocol.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
@@ -72,6 +74,7 @@ private:
             ESP_LOGI(TAG, "Boot button clicked");
             if (app.GetInterComStatus())
             {
+                app.AbortSpeaking(kAbortReasonNone);
                 app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"stop\",\"target\":\"1658\"}");
                 app.SetInterCom(false);
             }
@@ -91,8 +94,14 @@ private:
                 this->SwitchNetworkType(); 
             }
             else { 
-                app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"start\",\"target\":\"1658\"}");
-                app.SetInterCom(true);
+                // 将耗时操作推迟到主循环中执行，避免阻塞按钮中断
+                app.Schedule([]() {
+                    auto& app = Application::GetInstance();
+                    app.AbortSpeaking(kAbortReasonNone);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"start\",\"target\":\"1658\"}");
+                    app.SetInterCom(true);
+                });
             }
         });
 
