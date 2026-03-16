@@ -10,6 +10,10 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 
+#if CONFIG_USE_CSI_RADAR
+#include "wifi_board.h"
+#endif
+
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
@@ -22,6 +26,10 @@ private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
     Button sensor_button_;
+
+#if CONFIG_USE_CSI_RADAR
+    WifiBoard csi_wifi_board_;
+#endif
 
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
@@ -107,6 +115,12 @@ public:
         InitializeCodecI2c();
         InitializeGPIO();
         InitializeButtons();
+
+#if CONFIG_USE_CSI_RADAR
+        ESP_LOGI(TAG, "Starting CSI WiFi board for radar...");
+        csi_wifi_board_.StartNetwork();
+#endif
+
         ESP_LOGI(TAG, "X1ML307Board initialized");
     }
 

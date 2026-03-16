@@ -36,6 +36,16 @@ WifiBoard::WifiBoard() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&timer_args, &connect_timer_);
+
+#if CONFIG_USE_CSI_RADAR
+    csi_radar_.SetCallback([](bool someone, bool moving, float breath_rate, int people_count) {
+        ESP_LOGI(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d",
+                 someone ? "是" : "否",
+                 moving ? "是" : "否",
+                 breath_rate,
+                 people_count);
+    });
+#endif
 }
 
 WifiBoard::~WifiBoard() {
@@ -114,6 +124,10 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
 #endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+#if CONFIG_USE_CSI_RADAR
+            ESP_LOGI(TAG, "Starting CSI Radar...");
+            CsiRadar::StartIfNeeded();
+#endif
             break;
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");

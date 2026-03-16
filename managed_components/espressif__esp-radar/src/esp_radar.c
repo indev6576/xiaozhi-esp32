@@ -1071,22 +1071,12 @@ esp_err_t esp_radar_wifi_init(esp_radar_wifi_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_wifi_inited) {
-        // Check if event loop already exists (created by WifiManager or other components)
-        esp_err_t loop_err = esp_event_loop_create_default();
-        if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
-            return loop_err;
-        }
-        esp_err_t netif_err = esp_netif_init();
-        if (netif_err != ESP_OK && netif_err != ESP_ERR_INVALID_STATE) {
-            return netif_err;
-        }
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        ESP_ERROR_CHECK(esp_netif_init());
         s_wifi_inited = true;
     }
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t wifi_err = esp_wifi_init(&cfg);
-    if (wifi_err != ESP_OK) {
-        return wifi_err;
-    }
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));

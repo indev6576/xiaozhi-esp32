@@ -10,7 +10,6 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
-#include "csi_radar.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -20,10 +19,6 @@
 #include <font_awesome.h>
 
 #define TAG "Application"
-
-#if CONFIG_USE_CSI_RADAR
-static CsiRadar csi_radar;
-#endif
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -49,17 +44,6 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
-
-#if CONFIG_USE_CSI_RADAR
-    static CsiRadar csi_radar;
-    csi_radar.SetCallback([](bool someone, bool moving, float breath_rate, int people_count) {
-        ESP_LOGI(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d",
-                 someone ? "是" : "否",
-                 moving ? "是" : "否",
-                 breath_rate,
-                 people_count);
-    });
-#endif
 }
 
 Application::~Application() {
@@ -145,8 +129,6 @@ void Application::Initialize() {
                 msg += data;
                 display->ShowNotification(msg.c_str(), 30000);
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
-                // Note: CSI Radar is started by WifiBoard when WiFi connects (see ml307_board.cc)
-                // For pure WiFi boards, CSI Radar is started after WiFi is connected
                 break;
             }
             case NetworkEvent::Disconnected:

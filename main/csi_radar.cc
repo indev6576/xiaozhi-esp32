@@ -7,6 +7,7 @@
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
+#include <esp_event_base.h>
 #include <string.h>
 #include <math.h>
 
@@ -14,6 +15,8 @@
 
 #define RADAR_BUFF_MAX_LEN 25
 #define BREATH_WINDOW_SIZE 60
+
+static float s_sort_buffer_[BREATH_WINDOW_SIZE];
 
 CsiRadar* CsiRadar::instance_ = nullptr;
 bool CsiRadar::s_initialized_ = false;
@@ -25,7 +28,7 @@ float CsiRadar::s_buff_wander_[RADAR_BUFF_MAX_LEN] = {0};
 float CsiRadar::s_buff_jitter_[RADAR_BUFF_MAX_LEN] = {0};
 uint32_t CsiRadar::s_buff_count_ = 0;
 
-float CsiRadar::predict_someone_threshold_ = 0;
+float CsiRadar::predict_someone_threshold_ = 0.001f;
 float CsiRadar::predict_someone_sensitivity_ = 0.15f;
 float CsiRadar::predict_move_threshold_ = 0.0003f;
 float CsiRadar::predict_move_sensitivity_ = 0.20f;
@@ -63,6 +66,21 @@ void CsiRadar::StartIfNeeded() {
     }
 }
 
+void CsiRadar::RadarCallbackImpl(void* ctx, const wifi_radar_info_t* info) {
+    if (instance_) {
+        static uint32_t last_log = 0;
+        uint32_t now = esp_log_timestamp();
+        if (now - last_log > 5000) {
+            ESP_LOGI(TAG, "RadarCallbackImpl called, waveform_wander=%.6f, waveform_jitter=%.6f",
+                     info->waveform_wander, info->waveform_jitter);
+            last_log = now;
+        }
+        instance_->ProcessRadarData(info);
+    } else {
+        ESP_LOGW(TAG, "RadarCallbackImpl called but instance_ is null!");
+    }
+}
+
 bool CsiRadar::Start() {
     if (s_initialized_) {
         ESP_LOGW(TAG, "CSI Radar already initialized");
@@ -72,44 +90,29 @@ bool CsiRadar::Start() {
     wifi_mode_t mode;
     esp_err_t err = esp_wifi_get_mode(&mode);
     
-    // Handle WiFi not initialized (error code 12289 = ESP_ERR_WIFI_NOT_INIT)
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        ESP_LOGW(TAG, "WiFi not initialized, initializing now...");
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        err = esp_wifi_init(&cfg);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to init WiFi: %d", err);
-            return false;
-        }
-        // Try to get mode again after initialization
-        err = esp_wifi_get_mode(&mode);
-    }
-    
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
         ESP_LOGE(TAG, "Failed to get WiFi mode: %d", err);
         return false;
     }
 
-    if (mode != WIFI_MODE_STA) {
-        // If WiFi is in AP mode or not started, configure as STA
-        esp_err_t err2 = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err2 != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to set WiFi mode to STA: %d", err2);
+    if (err == ESP_ERR_WIFI_NOT_INIT || mode != WIFI_MODE_STA) {
+        if (mode != WIFI_MODE_STA) {
+            err = esp_wifi_set_mode(WIFI_MODE_STA);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to set WiFi mode to STA: %d", err);
+                return false;
+            }
+        }
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start WiFi: %d", err);
             return false;
         }
-
-        err2 = esp_wifi_start();
-        if (err2 != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start WiFi: %d", err2);
-            return false;
-        }
-        ESP_LOGI(TAG, "WiFi initialized and started in STA mode for CSI Radar");
+        ESP_LOGI(TAG, "WiFi initialized in STA mode");
     } else {
-        ESP_LOGI(TAG, "WiFi already in STA mode, ready for CSI Radar");
+        ESP_LOGI(TAG, "WiFi already in STA mode");
     }
 
-    // Wait for WiFi to be ready (not scanning, not in config mode)
-    // This is needed because WifiBoard may be in config mode (AP + STA scanning)
     wifi_ap_record_t ap_info;
     int retry = 0;
     const int max_retries = 20;
@@ -118,26 +121,11 @@ bool CsiRadar::Start() {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (retry >= max_retries) {
-        ESP_LOGW(TAG, "WiFi is in config mode or scanning, skipping CSI Radar for now");
-        // Return true to not block the rest of the application
-        // CSI Radar will be started when WiFi is properly connected
+        ESP_LOGW(TAG, "WiFi not connected, skipping CSI Radar");
         return true;
     }
-    ESP_LOGI(TAG, "WiFi connected, starting CSI Radar...");
+    ESP_LOGI(TAG, "WiFi connected to %s (channel %d)", ap_info.ssid, ap_info.primary);
 
-    // Since WifiManager has already created the WiFi netif and started WiFi,
-    // we skip esp_radar_wifi_init which would fail with duplicate netif.
-    // Instead, we initialize CSI directly.
-    esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
-    esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
-
-    csi_config.csi_recv_interval = 50;
-    csi_config.csi_filtered_cb = NULL;
-    memcpy(csi_config.filter_mac, "\x1a\x00\x00\x00\x00\x00", 6);
-
-    dec_config.wifi_radar_cb = RadarCallbackImpl;
-
-    // Ensure event loop exists
     esp_err_t loop_err = esp_event_loop_create_default();
     if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to create event loop: %d", loop_err);
@@ -145,24 +133,88 @@ bool CsiRadar::Start() {
     }
     ESP_LOGI(TAG, "Event loop ready");
 
-    // Skip esp_radar_wifi_init since WiFi is already configured by WifiManager
-    // Just initialize CSI directly
+    esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
+    esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
+
+    csi_config.csi_recv_interval = 50;
+    csi_config.csi_filtered_cb = NULL;
+    csi_config.dump_ack_en = true;
+    memset(csi_config.filter_mac, 0, 6);
+
+    dec_config.wifi_radar_cb = RadarCallbackImpl;
+    dec_config.ltf_type = RADAR_LTF_TYPE_LLTF;
+    dec_config.outliers_threshold = 0;
+    dec_config.csi_handle_time = 200;
+    dec_config.dec_window_size = 4;
+
+    ESP_LOGI(TAG, "Initializing CSI and decoder...");
     err = esp_radar_csi_init(&csi_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init CSI: %d", err);
-        return false;
+    } else {
+        ESP_LOGI(TAG, "CSI init success");
     }
 
     err = esp_radar_dec_init(&dec_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init decoder: %d", err);
-        return false;
+    } else {
+        ESP_LOGI(TAG, "Decoder init success");
     }
 
     err = esp_radar_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start radar: %d", err);
-        return false;
+    } else {
+        ESP_LOGI(TAG, "Radar started successfully");
+    }
+
+    xTaskCreate([](void* arg) {
+        wifi_ap_record_t ap_info;
+        uint8_t sta_mac[6];
+        esp_wifi_sta_get_ap_info(&ap_info);
+        esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+
+        typedef struct {
+            uint8_t frame_control[2];
+            uint16_t duration;
+            uint8_t destination_address[6];
+            uint8_t source_address[6];
+            uint8_t broadcast_address[6];
+            uint16_t sequence_control;
+        } __attribute__((packed)) wifi_null_data_t;
+
+        wifi_null_data_t null_data = {
+            .frame_control = {0x48, 0x01},
+            .duration = 0x0000,
+            .sequence_control = 0x0000,
+        };
+
+        memcpy(null_data.destination_address, ap_info.bssid, 6);
+        memcpy(null_data.broadcast_address, ap_info.bssid, 6);
+        memcpy(null_data.source_address, sta_mac, 6);
+
+        esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
+        
+        ESP_LOGI(TAG, "Starting NULL data sender");
+        
+        while (true) {
+            esp_wifi_80211_tx(WIFI_IF_STA, &null_data, sizeof(wifi_null_data_t), true);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }, "null_data_sender", 2048, NULL, 3, NULL);
+
+    static bool event_handler_registered = false;
+    if (!event_handler_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, [](void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+            ESP_LOGW(TAG, "WiFi disconnected");
+        }, NULL));
+        
+        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, [](void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+            ESP_LOGI(TAG, "WiFi reconnected");
+        }, NULL));
+        
+        event_handler_registered = true;
     }
 
     s_initialized_ = true;
@@ -190,15 +242,8 @@ void CsiRadar::Stop() {
         return;
     }
 
-    esp_radar_stop();
     s_initialized_ = false;
     ESP_LOGI(TAG, "CSI Radar stopped");
-}
-
-void CsiRadar::RadarCallbackImpl(void* ctx, const wifi_radar_info_t* info) {
-    if (instance_) {
-        instance_->ProcessRadarData(info);
-    }
 }
 
 void CsiRadar::ProcessRadarData(const wifi_radar_info_t* info) {
@@ -211,6 +256,12 @@ void CsiRadar::ProcessRadarData(const wifi_radar_info_t* info) {
     s_buff_wander_[s_buff_count_ % RADAR_BUFF_MAX_LEN] = info->waveform_wander;
     s_buff_jitter_[s_buff_count_ % RADAR_BUFF_MAX_LEN] = info->waveform_jitter;
     s_buff_count_++;
+
+    static uint32_t last_count_log = 0;
+    if (s_buff_count_ % 100 == 0 && s_buff_count_ != last_count_log) {
+        ESP_LOGI(TAG, "CSI data buffer count: %u/%u", s_buff_count_, buff_max_size);
+        last_count_log = s_buff_count_;
+    }
 
     if (s_buff_count_ < buff_max_size) {
         return;
@@ -288,7 +339,6 @@ void CsiRadar::ProcessRadarData(const wifi_radar_info_t* info) {
             float mean = sum / s_breath_sample_count_;
             float variance = (sumsq / s_breath_sample_count_) - (mean * mean);
             float std_dev = (variance > 0) ? sqrtf(variance) : 0;
-            float range = max_val - min_val;
 
             if (!room_status || !human_status) {
                 s_noise_floor_ = s_noise_floor_ * 0.95f + mean * 0.05f;
@@ -309,80 +359,63 @@ void CsiRadar::ProcessRadarData(const wifi_radar_info_t* info) {
                         corr += dx * dy;
                     }
                     corr /= (s_breath_sample_count_ - lag);
-
                     if (corr > max_corr) {
                         max_corr = corr;
                         best_lag = lag;
                     }
                 }
 
-                if (max_corr > 0.3f * variance && best_lag > 0) {
+                if (max_corr > std_dev * std_dev * 0.5f) {
                     breath_detected = true;
-                    float period_sec = best_lag / 3.0f;
-                    breath_rate = 60.0f / period_sec;
-                    breath_rate = s_breath_rate_smooth_ * 0.7f + breath_rate * 0.3f;
-                    s_breath_rate_smooth_ = breath_rate;
-
-                    if (breath_rate < 8) breath_rate = 8;
-                    if (breath_rate > 30) breath_rate = 30;
+                    float breath_rate_raw = 1000.0f / best_lag;
+                    s_breath_rate_smooth_ = s_breath_rate_smooth_ * 0.7f + breath_rate_raw * 0.3f;
+                    breath_rate = s_breath_rate_smooth_;
                 }
             }
 
-            if (room_status && !breath_detected && range > 0.03f) {
-                breath_rate = mean * 500;
-                if (breath_rate < 8) breath_rate = 8;
-                if (breath_rate > 30) breath_rate = 30;
+            if (!breath_detected) {
+                s_breath_rate_smooth_ = s_breath_rate_smooth_ * 0.95f;
+                breath_rate = s_breath_rate_smooth_;
             }
-
-            ESP_LOGD(TAG, "呼吸检测: mean=%.4f, std=%.4f, range=%.4f, noise=%.4f, thresh=%.4f, rate=%.1f",
-                     mean, std_dev, range, s_noise_floor_, s_breath_threshold_, breath_rate);
         }
-    }
 
-    if (current_time - s_last_update_time_ >= 1000) {
+        int people_count = (room_status && human_status) ? 1 : 0;
         bool final_room_status = s_last_room_status_ || room_status;
         bool final_human_status = human_status;
-        int people_count = final_room_status ? 1 : 0;
 
-        if (final_human_status) {
-            ESP_LOGW(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d",
-                     final_room_status ? "是" : "否",
-                     final_human_status ? "是" : "否",
-                     breath_rate,
-                     people_count);
-        } else {
+        if (current_time - s_last_update_time_ >= 3000) {
             ESP_LOGI(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d",
                      final_room_status ? "是" : "否",
                      final_human_status ? "是" : "否",
                      breath_rate,
                      people_count);
-        }
 
-        if (callback_) {
-            callback_(final_room_status, final_human_status, breath_rate, people_count);
-        }
+            if (callback_) {
+                callback_(final_room_status, final_human_status, breath_rate, people_count);
+            }
 
-        s_last_update_time_ = current_time;
-        s_last_room_status_ = room_status;
-        s_last_human_status_ = human_status;
-    } else {
-        if (room_status) s_last_room_status_ = true;
-        s_last_human_status_ = human_status;
+            s_last_update_time_ = current_time;
+            s_last_room_status_ = room_status;
+            s_last_human_status_ = human_status;
+        } else {
+            if (room_status) s_last_room_status_ = true;
+            s_last_human_status_ = human_status;
+        }
     }
 }
 
 float CsiRadar::trimmean(const float* array, size_t len, float percent) {
     if (len == 0) return 0;
+    if (len > RADAR_BUFF_MAX_LEN) len = RADAR_BUFF_MAX_LEN;
 
-    float* sorted = new float[len];
-    memcpy(sorted, array, len * sizeof(float));
+    memcpy(s_sort_buffer_, array, len * sizeof(float));
 
     for (int i = 0; i < (int)len - 1; i++) {
         for (int j = 0; j < (int)len - i - 1; j++) {
-            if (sorted[j] > sorted[j + 1]) {
-                float temp = sorted[j];
-                sorted[j] = sorted[j + 1];
-                sorted[j + 1] = temp;
+            if (s_sort_buffer_[j] > s_sort_buffer_[j + 1]) {
+                float temp = s_sort_buffer_[j];
+                s_sort_buffer_[j] = s_sort_buffer_[j + 1];
+                s_sort_buffer_[j + 1] = temp;
             }
         }
     }
@@ -392,33 +425,30 @@ float CsiRadar::trimmean(const float* array, size_t len, float percent) {
     size_t count = 0;
 
     for (size_t i = trim_count; i < len - trim_count; i++) {
-        sum += sorted[i];
+        sum += s_sort_buffer_[i];
         count++;
     }
 
-    delete[] sorted;
     return count > 0 ? sum / count : 0;
 }
 
 float CsiRadar::median(const float* a, size_t len) {
     if (len == 0) return 0;
+    if (len > RADAR_BUFF_MAX_LEN) len = RADAR_BUFF_MAX_LEN;
 
-    float* sorted = new float[len];
-    memcpy(sorted, a, len * sizeof(float));
+    memcpy(s_sort_buffer_, a, len * sizeof(float));
 
     for (int i = 0; i < (int)len - 1; i++) {
         for (int j = 0; j < (int)len - i - 1; j++) {
-            if (sorted[j] > sorted[j + 1]) {
-                float temp = sorted[j];
-                sorted[j] = sorted[j + 1];
-                sorted[j + 1] = temp;
+            if (s_sort_buffer_[j] > s_sort_buffer_[j + 1]) {
+                float temp = s_sort_buffer_[j];
+                s_sort_buffer_[j] = s_sort_buffer_[j + 1];
+                s_sort_buffer_[j + 1] = temp;
             }
         }
     }
 
-    float result = sorted[len / 2];
-    delete[] sorted;
-    return result;
+    return len % 2 ? s_sort_buffer_[len / 2] : (s_sort_buffer_[len / 2 - 1] + s_sort_buffer_[len / 2]) / 2;
 }
 
 #endif

@@ -3,7 +3,6 @@
 #include "audio_codec.h"
 #include "display.h"
 #include "assets/lang_config.h"
-#include "csi_radar.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -88,24 +87,6 @@ void Ml307Board::NetworkTask() {
     }
 
     ESP_LOGI(TAG, "Modem detected successfully");
-
-    // Initialize WiFi for CSI Radar (even in 4G mode, WiFi can collect CSI data)
-    // Use WifiBoard to leverage existing WiFi functionality
-#if CONFIG_USE_CSI_RADAR
-    ESP_LOGI(TAG, "Initializing WiFi for CSI Radar via WifiBoard...");
-
-    // Set up WiFi event callback to start CSI Radar when WiFi connects
-    wifi_board_.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
-        if (event == NetworkEvent::Connected) {
-            ESP_LOGI(TAG, "WiFi connected, starting CSI Radar...");
-            // Start CSI Radar after WiFi is connected
-            CsiRadar::StartIfNeeded();
-        }
-    });
-    
-    // Use WifiBoard's network start which handles WiFi initialization and config mode
-    wifi_board_.StartNetwork();
-#endif
 
     // Set up network state change callback
     // Note: Don't call GetCarrierName() here as it sends AT command and will block ReceiveTask

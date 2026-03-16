@@ -147,7 +147,6 @@ private:
     TaskHandle_t activation_task_handle_ = nullptr;
     bool has_start_intercom_ = false;
 
-
     // Event handlers
     void HandleStateChangedEvent();
     void HandleToggleChatEvent();

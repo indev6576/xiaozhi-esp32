@@ -6,11 +6,19 @@
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
 
+#if CONFIG_USE_CSI_RADAR
+#include "csi_radar.h"
+#endif
+
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
+
+#if CONFIG_USE_CSI_RADAR
+    CsiRadar csi_radar_;
+#endif
 
     virtual std::string GetBoardJson() override;
 
