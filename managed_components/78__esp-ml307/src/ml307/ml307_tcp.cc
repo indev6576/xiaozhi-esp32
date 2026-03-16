@@ -182,7 +182,9 @@ int Ml307Tcp::Send(const std::string& data) {
 
         xEventGroupClearBits(event_group_handle_, ML307_TCP_SEND_COMPLETE);
         
-        at_uart_->SendCommand(command, timeout_ms, false);
+        if (!at_uart_->SendCommand(command, timeout_ms, false)) {
+            ESP_LOGE(TAG, "SendCommand 失败，tcp_id=%d", tcp_id_);
+        }
 
         auto bits = xEventGroupWaitBits(event_group_handle_, ML307_TCP_SEND_COMPLETE, pdTRUE, pdFALSE, pdMS_TO_TICKS(50));
         if (!(bits & ML307_TCP_SEND_COMPLETE)) {
