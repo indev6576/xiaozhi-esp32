@@ -9,10 +9,10 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "lamp_controller.h"
-#include "led/single_led.h"
+#include "led/circular_strip.h"
 #include "assets/lang_config.h"
 
-#if CONFIG_USE_CSI_RADAR
+#if CONFIG_USE_CSI_RADAR                                                                                                                                                                                                                                                                   
 #include "wifi_board.h"
 #endif
 
@@ -27,7 +27,7 @@ class X1ML307Board : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
-    Button sensor_button_;
+    Button charge_button;
 
 #if CONFIG_USE_CSI_RADAR
     WifiBoard csi_wifi_board_;
@@ -89,7 +89,7 @@ private:
         });
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
-            auto& board = Board::GetInstance();
+            // auto& board = Board::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
                 this->SwitchNetworkType(); 
             }
@@ -105,12 +105,12 @@ private:
             }
         });
 
-        sensor_button_.OnPressDown([this]() {
+        charge_button.OnPressDown([this]() {
             auto& app = Application::GetInstance();
             app.SendMessage("{\"type\":\"sensor_dev2serv\",\"people_in\":\"yes\"}");
             ESP_LOGI(TAG, "Sensor detect people in");
         });
-        sensor_button_.OnPressUp([this]() {
+        charge_button.OnPressUp([this]() {
             auto& app = Application::GetInstance();
             app.SendMessage("{\"type\":\"sensor_dev2serv\",\"people_in\":\"no\"}");
             ESP_LOGI(TAG, "Sensor detect people out");
@@ -119,7 +119,7 @@ private:
 
 
 public:
-    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true), sensor_button_(SENSOR_BUTTON_GPIO, true){
+    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true), charge_button(CHARGE_PIN_GPIO){
 
         InitializeCodecI2c();
         InitializeGPIO();
@@ -134,7 +134,7 @@ public:
     }
 
     virtual Led* GetLed() override {
-        static SingleLed led(BUILTIN_LED_GPIO);
+        static CircularStrip led(BUILTIN_LED_GPIO, 3);
         return &led;
     }
 

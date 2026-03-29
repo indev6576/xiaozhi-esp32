@@ -8,7 +8,7 @@ documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/au
 issues: https://github.com/espressif/esp-iot-solution/issues
 repository: git://github.com/espressif/esp-iot-solution.git
 repository_info:
-  commit_sha: af9f2435ac94a70ad6d21b164e1d52d23d3c424a
+  commit_sha: 66cfc37bc71774d88d878a3a4f124d25ffc5afc6
   path: components/audio/adc_mic
 url: https://github.com/espressif/esp-iot-solution/tree/master/components/audio/adc_mic
-version: 0.2.1
+version: 0.2.2

@@ -55,7 +55,6 @@ Ml307Tcp::Ml307Tcp(std::shared_ptr<AtUart> at_uart, int tcp_id) : at_uart_(at_ua
                 xEventGroupSetBits(event_group_handle_, ML307_TCP_INITIALIZED);
             }
         } else if (command == "FIFO_OVERFLOW") {
-            ESP_LOGW(TAG, "FIFO_OVERFLOW detected, scheduling async disconnect");
             xEventGroupSetBits(event_group_handle_, ML307_TCP_ERROR);
             Disconnect();
         }
@@ -158,12 +157,14 @@ int Ml307Tcp::Send(const std::string& data) {
         return -1;
     }
 
+    // 在循环外预先分配command
     std::string command;
-    command.reserve(32 + MAX_PACKET_SIZE * 2);
+    command.reserve(32 + MAX_PACKET_SIZE * 2);  // 预分配最大可能需要的空间
 
     while (total_sent < data.size()) {
         size_t chunk_size = std::min(data.size() - total_sent, MAX_PACKET_SIZE);
         
+        // 重置command并构建新的命令，利用预分配的容量
         command.clear();
         command += "AT+MIPSEND=";
         command += std::to_string(tcp_id_);
@@ -171,24 +172,28 @@ int Ml307Tcp::Send(const std::string& data) {
         command += std::to_string(chunk_size);
         command += ",";
         
+        // 直接在command字符串上进行十六进制编码
         at_uart_->EncodeHexAppend(command, data.data() + total_sent, chunk_size);
         command += "\r\n";
         
+        // 根据波特率和命令长度动态计算超时：传输时间(10位/字节) + 处理余量
         int baud = at_uart_->GetBaudRate();
         if (baud <= 0) baud = 115200;
         size_t bytes_to_tx = command.size();
+        // 发送位数≈字节*10（1起始+8数据+1停止），转毫秒
         uint32_t tx_time_ms = static_cast<uint32_t>((bytes_to_tx * 10ULL * 1000ULL) / static_cast<uint32_t>(baud));
-        uint32_t timeout_ms = tx_time_ms + 200;
+        uint32_t timeout_ms = tx_time_ms + 100; // 余量
 
-        xEventGroupClearBits(event_group_handle_, ML307_TCP_SEND_COMPLETE);
-        
         if (!at_uart_->SendCommand(command, timeout_ms, false)) {
-            ESP_LOGE(TAG, "SendCommand 失败，tcp_id=%d", tcp_id_);
+            ESP_LOGE(TAG, "Failed to send data chunk");
+            Disconnect();
+            return -1;
         }
 
-        auto bits = xEventGroupWaitBits(event_group_handle_, ML307_TCP_SEND_COMPLETE, pdTRUE, pdFALSE, pdMS_TO_TICKS(50));
+        auto bits = xEventGroupWaitBits(event_group_handle_, ML307_TCP_SEND_COMPLETE, pdTRUE, pdFALSE, pdMS_TO_TICKS(TCP_CONNECT_TIMEOUT_MS));
         if (!(bits & ML307_TCP_SEND_COMPLETE)) {
-            // ESP_LOGW(TAG, "No MIPSEND URC, assuming send success");
+            ESP_LOGE(TAG, "No send confirmation received");
+            return -1;
         }
 
         total_sent += chunk_size;
