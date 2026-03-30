@@ -62,6 +62,9 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    auto led = board.GetLed();
+    led->OnStateChanged();
+
     // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
