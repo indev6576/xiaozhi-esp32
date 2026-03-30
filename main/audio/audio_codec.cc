@@ -41,8 +41,8 @@ void AudioCodec::Start() {
 }
 
 void AudioCodec::SetOutputVolume(int volume) {
-    if (volume >= 75) {
-        volume = 75;
+    if (volume >= 100) {
+        volume = 100;
     }
     output_volume_ = volume;
     ESP_LOGI(TAG, "Set output volume to %d", output_volume_);

@@ -53,6 +53,10 @@ private:
             app.ToggleChatState();
         });
 
+        boot_button_.OnDoubleClick([this]() {
+            GetAudioCodec()->SetOutputVolume(100);
+        });
+
         touch_button_.OnClick([this]() {
             // Application::GetInstance().StartListening();
         ESP_LOGW(TAG, "OnClick");
