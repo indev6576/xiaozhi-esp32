@@ -1,0 +1,200 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+
+// 1. 选择目标板卡
+// #define CONFIG_IDF_TARGET_X12519
+// #define CONFIG_IDF_TARGET_X12513
+#define CONFIG_IDF_TARGET_M0
+// #define CONFIG_IDF_TARGET_X1_25110
+
+// 2. 选择产品型号（注释掉不选默认为开发板）
+// #define XIAOLU // 用于切换小猴成品（XIAOLU)、音箱(YINXIANG)
+
+// 3. 选择唤醒词(不要修改)
+// 目前支持多唤醒词：你好小智、你好小鑫
+
+// 4. 二级配置(自动选择，不要修改)
+#ifdef XIAOLU
+// #define SHAKE_INTERRUPT
+#define LOW_BATTERY_SHUTDOWN
+#endif // XIAOLU
+
+#define AUDIO_INPUT_SAMPLE_RATE 16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+
+// *****************************************************************
+#ifdef CONFIG_IDF_TARGET_X12519
+#define MODEL_NAME "x12519" // 固定型号为 x12519
+// X1_2512D 南京50pcs出货
+#define AUDIO_I2S_MIC_GPIO_WS GPIO_NUM_6
+#define AUDIO_I2S_MIC_GPIO_DIN GPIO_NUM_4
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_15
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_16
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_17
+#define AUDIO_I2S_SPK_GPIO_MODE GPIO_NUM_18
+
+#define BOOT_BUTTON_GPIO GPIO_NUM_5     // 开关机按键，短按开机，长按关机
+#define FUNCTION_BUTTON_GPIO GPIO_NUM_1 // 功能按键，用于拍拍打断播放
+
+#define VOLTAGE_BAT_GPIO GPIO_NUM_3 // 电池电量检测引脚
+#define VOLTAGE_BAT_ADC_UNIT ADC_UNIT_1
+#define VOLTAGE_BAT_ADC_CH ADC_CHANNEL_2
+#define BUILTIN_LED_GPIO GPIO_NUM_21 // 内置LED灯引脚
+
+#define BAT_CHARGE_PIN GPIO_NUM_14 // 内置LED灯引脚
+#define POWER_PIN GPIO_NUM_37
+
+#define DISPLAY_CS GPIO_NUM_7
+#define DISPLAY_RES GPIO_NUM_8
+#define DISPLAY_SCL GPIO_NUM_9
+#define DISPLAY_SDA GPIO_NUM_10
+#define DISPLAY_DC GPIO_NUM_11
+#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_12
+#define DISPLAY_SPI_SCLK_HZ (40 * 1000 * 1000)
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 240
+#define DISPLAY_SWAP_XY false
+#define DISPLAY_MIRROR_X true
+#define DISPLAY_MIRROR_Y false
+#define DISPLAY_OFFSET_X 0
+#define DISPLAY_OFFSET_Y 10
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
+
+// ML307管脚待定义，这里是假的，需要根据实际情况修改
+#define ML307_RX_PIN GPIO_NUM_43  // S3串口RX
+#define ML307_TX_PIN GPIO_NUM_42  // S3串口TX
+#define ML307_POWER_EN GPIO_NUM_2 // S3串口TX
+
+// *****************************************************************
+#elif defined(CONFIG_IDF_TARGET_X12513)
+#define MODEL_NAME "x12513" // 固定型号为 x12513
+// X1_2512D 南京50pcs出货
+#define AUDIO_I2S_MIC_GPIO_WS GPIO_NUM_6
+#define AUDIO_I2S_MIC_GPIO_DIN GPIO_NUM_4
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_15
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_16
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_17
+#define AUDIO_I2S_SPK_GPIO_MODE GPIO_NUM_18
+
+#define BOOT_BUTTON_GPIO GPIO_NUM_5      // 开关机按键，短按开机，长按关机
+#define FUNCTION_BUTTON_GPIO GPIO_NUM_13 // 功能按键，用于拍拍打断播放
+
+#define VOLTAGE_BAT_GPIO GPIO_NUM_3 // 电池电量检测引脚
+#define VOLTAGE_BAT_ADC_UNIT ADC_UNIT_1
+#define VOLTAGE_BAT_ADC_CH ADC_CHANNEL_2
+#define BUILTIN_LED_GPIO GPIO_NUM_21 // 内置LED灯引脚
+
+#define BAT_CHARGE_PIN GPIO_NUM_38 // 内置LED灯引脚
+#define POWER_PIN GPIO_NUM_37
+
+#define DISPLAY_CS GPIO_NUM_7
+#define DISPLAY_RES GPIO_NUM_8
+#define DISPLAY_SCL GPIO_NUM_9
+#define DISPLAY_SDA GPIO_NUM_10
+#define DISPLAY_DC GPIO_NUM_11
+#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_12
+#define DISPLAY_SPI_SCLK_HZ (40 * 1000 * 1000)
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 240
+#define DISPLAY_SWAP_XY false
+#define DISPLAY_MIRROR_X true
+#define DISPLAY_MIRROR_Y false
+#define DISPLAY_OFFSET_X 0
+#define DISPLAY_OFFSET_Y 0
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
+
+// ML307管脚待定义，这里是假的，需要根据实际情况修改
+#define ML307_RX_PIN GPIO_NUM_11
+#define ML307_TX_PIN GPIO_NUM_12
+
+#elif defined(CONFIG_IDF_TARGET_M0)
+#define MODEL_NAME "M02513" // 固定型号为 x12513
+// M0_2512D
+#define AUDIO_I2S_MIC_GPIO_WS GPIO_NUM_6
+#define AUDIO_I2S_MIC_GPIO_DIN GPIO_NUM_4
+
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_7
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_15
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_16
+#define AUDIO_I2S_SPK_GPIO_MODE GPIO_NUM_21
+
+#define BOOT_BUTTON_GPIO GPIO_NUM_0     // 开关机按键，短按开机，长按关机
+#define FUNCTION_BUTTON_GPIO GPIO_NUM_1 // 功能按键，用于拍拍打断播放
+
+#define VOLTAGE_BAT_GPIO GPIO_NUM_3 // 电池电量检测引脚
+#define VOLTAGE_BAT_ADC_UNIT ADC_UNIT_1
+#define VOLTAGE_BAT_ADC_CH ADC_CHANNEL_2
+#define BUILTIN_LED_GPIO GPIO_NUM_40 // 内置LED灯引脚
+
+#define BAT_CHARGE_PIN GPIO_NUM_38 // 内置LED灯引脚
+#define POWER_PIN GPIO_NUM_37
+
+#define DISPLAY_SDA GPIO_NUM_10
+#define DISPLAY_SCL GPIO_NUM_9
+#define DISPLAY_DC GPIO_NUM_8
+#define DISPLAY_CS GPIO_NUM_14
+#define DISPLAY_RES GPIO_NUM_18
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 240
+#define DISPLAY_SWAP_XY false
+#define DISPLAY_MIRROR_X true
+#define DISPLAY_MIRROR_Y false
+#define BACKLIGHT_INVERT false
+#define DISPLAY_OFFSET_X 0
+#define DISPLAY_OFFSET_Y 0
+#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_13
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
+#define DISPLAY_SPI_SCLK_HZ (40 * 1000 * 1000)
+
+#define ML307_RX_PIN GPIO_NUM_42
+#define ML307_TX_PIN GPIO_NUM_41
+
+#elif defined(CONFIG_IDF_TARGET_X1_25110)
+// X1_25110 旧版紫色
+#define AUDIO_I2S_MIC_GPIO_WS GPIO_NUM_42
+#define AUDIO_I2S_MIC_GPIO_SCK GPIO_NUM_40
+#define AUDIO_I2S_MIC_GPIO_DIN GPIO_NUM_2
+
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_15
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_16
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_17
+#define AUDIO_I2S_SPK_GPIO_EN GPIO_NUM_18
+#define BOOT_BUTTON_GPIO GPIO_NUM_1     // 开关机按键，短按开机，长按关机
+#define FUNCTION_BUTTON_GPIO GPIO_NUM_5 // 功能按键，用于打断播放
+
+#define LED_PIN GPIO_NUM_8
+#define VOLTAGE_BAT_GPIO GPIO_NUM_21
+#define VOLTAGE_BAT_ADC_CH ADC_CHANNEL_2 // 电池电量检测引脚
+
+// 以下引脚没有使用
+#define BUILTIN_LED_GPIO GPIO_NUM_11     // 假的
+#endif
+
+// 定义reason枚举
+enum class SleepReason
+{
+    SHUTDOWN,
+    LOW_BATTERY,
+    IDLE_TIMEOUT,
+    WIFI_CONNECT_LOST,
+    WIFI_CONFIG_TIMEOUT,
+    SYS_ERROR
+};
+
+// 长时间没有唤醒则进入系统休眠
+#define TIMEOUT_WIFICONFIG_IDLE 60    // x10 seconds 休眠
+#define SECONDS_IDLE 180      // seconds 休眠
+#define SECONDS_SLEEP 60      // seconds 休眠
+
+// 工厂产线默认WiFi配置
+// #define FACTORY_SSID "xjhhsjbdhud985"
+// #define FACTORY_PASSWORD "ss559550"
+#define FACTORY_SSID "inffee.com"
+#define FACTORY_PASSWORD "ss559550"
+// #define FACTORY_SSID "wasu_501"
+// #define FACTORY_PASSWORD "15068152676"
+#define FACTORY_DEFUALT_VOLUME 50
+
+#endif // _BOARD_CONFIG_H_
