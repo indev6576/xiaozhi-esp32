@@ -78,6 +78,7 @@ void Application::Initialize() {
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_VIBRATION);
+        // audio_service_.PlaySound(Lang::Sounds::OGG_BOOT);
     });
 
     AudioServiceCallbacks callbacks;
