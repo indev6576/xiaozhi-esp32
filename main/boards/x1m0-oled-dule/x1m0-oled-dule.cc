@@ -57,6 +57,10 @@ private:
             GetAudioCodec()->SetOutputVolume(100);
         });
 
+        boot_button_.OnLongPress([this]() {
+            ResetNvm();
+        });
+
         touch_button_.OnClick([this]() {
             // Application::GetInstance().StartListening();
         ESP_LOGW(TAG, "OnClick");

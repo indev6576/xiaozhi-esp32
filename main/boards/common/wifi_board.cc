@@ -170,6 +170,46 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
     board->StartWifiConfigMode();
 }
 
+void WifiBoard::ResetNvm() 
+{
+    auto &ssid_manager = SsidManager::GetInstance();
+    auto ssid_list = ssid_manager.GetSsidList();
+    // 初始化 NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        // NVS 分区需要擦除
+        ESP_LOGW(TAG, "NVS partition was truncated and needs to be erased. Erasing...");
+        err = nvs_flash_erase();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to erase NVS partition: %s", esp_err_to_name(err));
+            return;
+        }
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize NVS: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "Factory Setting: clearing WiFi configuration.");
+    ssid_manager.Clear();
+    // 处理 wifi 命名空间的设置
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("force_ap", 1);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    // 处理 audio 命名空间的设置
+    {
+        ESP_LOGI(TAG, "Factory Setting: Set output volume to %d", 90);
+        Settings settings("audio", true);
+        settings.SetInt("output_volume", 90);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
     // Transition to wifi configuring state
