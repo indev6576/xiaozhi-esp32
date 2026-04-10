@@ -151,19 +151,19 @@ void AudioService::Start() {
     }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_, 1);
 
     /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048, this, 4, &audio_output_task_handle_, 1);
 #endif
 
     /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    }, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_, 1);
 }
 
 void AudioService::Stop() {
@@ -579,6 +579,12 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 void AudioService::EnableVoiceProcessing(bool enable) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
+        // Disable wake word detection to avoid running two AFE pipelines simultaneously
+        if (wake_word_ && wake_word_initialized_) {
+            wake_word_->Stop();
+            xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        }
+
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
             audio_processor_initialized_ = true;
@@ -600,6 +606,12 @@ void AudioService::EnableVoiceProcessing(bool enable) {
     } else {
         audio_processor_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        
+        // Re-enable wake word detection when voice processing is disabled
+        if (wake_word_ && wake_word_initialized_) {
+            wake_word_->Start();
+            xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        }
     }
 }
 

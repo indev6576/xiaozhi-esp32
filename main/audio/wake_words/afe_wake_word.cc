@@ -181,7 +181,7 @@ void AfeWakeWord::EncodeWakeWordData() {
         assert(wake_word_encode_task_buffer_ != nullptr);
     }
 
-    wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
+    wake_word_encode_task_ = xTaskCreateStaticPinnedToCore([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         {
             auto start_time = esp_timer_get_time();
@@ -249,7 +249,7 @@ void AfeWakeWord::EncodeWakeWordData() {
             this_->wake_word_cv_.notify_all();
         }
         vTaskDelete(NULL);
-    }, "encode_wake_word", stack_size, this, 2, wake_word_encode_task_stack_, wake_word_encode_task_buffer_);
+    }, "encode_wake_word", stack_size, this, 2, wake_word_encode_task_stack_, wake_word_encode_task_buffer_, 1);
 }
 
 bool AfeWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {

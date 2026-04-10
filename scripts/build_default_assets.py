@@ -154,9 +154,9 @@ def copy_directory(src, dst):
         return False
 
 
-def process_sr_models(wakenet_model_dirs, multinet_model_dirs, build_dir, assets_dir):
-    """Process SR models (wakenet and multinet) and generate srmodels.bin"""
-    if not wakenet_model_dirs and not multinet_model_dirs:
+def process_sr_models(wakenet_model_dirs, multinet_model_dirs, nsnet_model_dirs, build_dir, assets_dir):
+    """Process SR models (wakenet, multinet, and nsnet) and generate srmodels.bin"""
+    if not wakenet_model_dirs and not multinet_model_dirs and not nsnet_model_dirs:
         return None
     
     # Create SR models build directory
@@ -184,6 +184,15 @@ def process_sr_models(wakenet_model_dirs, multinet_model_dirs, build_dir, assets
             if copy_directory(multinet_model_dir, multinet_dst):
                 models_processed += 1
                 print(f"Added multinet model: {multinet_name}")
+    
+    # Copy noise suppression models if available
+    if nsnet_model_dirs:
+        for nsnet_model_dir in nsnet_model_dirs:
+            nsnet_name = os.path.basename(nsnet_model_dir)
+            nsnet_dst = os.path.join(sr_models_build_dir, nsnet_name)
+            if copy_directory(nsnet_model_dir, nsnet_dst):
+                models_processed += 1
+                print(f"Added noise suppression model: {nsnet_name}")
     
     if models_processed == 0:
         print("Warning: No SR models were successfully processed")
@@ -528,6 +537,30 @@ def read_multinet_from_sdkconfig(sdkconfig_path):
     return models
 
 
+def read_nsnet_from_sdkconfig(sdkconfig_path):
+    """
+    Read noise suppression models from sdkconfig
+    Returns a list of nsnet model names
+    """
+    if not os.path.exists(sdkconfig_path):
+        print(f"Warning: sdkconfig file not found: {sdkconfig_path}")
+        return []
+        
+    models = []
+    with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
+        for label in f:
+            label = label.strip("\n")
+            if 'CONFIG_SR_NSN_' in label and '#' not in label[0]:
+                if '=y' in label:
+                    # Extract model name from config
+                    if 'CONFIG_SR_NSN_NSNET2' in label:
+                        models.append('nsnet2')
+                    elif 'CONFIG_SR_NSN_NSNET1' in label:
+                        models.append('nsnet1')
+
+    return models
+
+
 def read_wake_word_type_from_sdkconfig(sdkconfig_path):
     """
     Read wake word type configuration from sdkconfig
@@ -683,6 +716,25 @@ def get_multinet_model_paths(model_names, esp_sr_model_path):
     return valid_paths
 
 
+def get_nsnet_model_paths(model_names, esp_sr_model_path):
+    """
+    Get the full paths to the noise suppression model directories
+    Returns a list of valid model paths
+    """
+    if not model_names:
+        return []
+    
+    valid_paths = []
+    for model_name in model_names:
+        nsnet_model_path = os.path.join(esp_sr_model_path, 'nsnet_model', model_name)
+        if os.path.exists(nsnet_model_path):
+            valid_paths.append(nsnet_model_path)
+        else:
+            print(f"Warning: Noise suppression model directory not found: {nsnet_model_path}")
+    
+    return valid_paths
+
+
 def get_text_font_path(builtin_text_font, xiaozhi_fonts_path):
     """
     Get the text font path if needed
@@ -747,7 +799,7 @@ def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path, proj
     return None
 
 
-def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None):
+def build_assets_integrated(wakenet_model_paths, multinet_model_paths, nsnet_model_paths, text_font_path, emoji_collection_path, extra_files_path, output_path, multinet_model_info=None):
     """
     Build assets using integrated functions (no external dependencies)
     """
@@ -765,7 +817,7 @@ def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font
         print("Starting to build assets...")
         
         # Process each component
-        srmodels = process_sr_models(wakenet_model_paths, multinet_model_paths, temp_build_dir, assets_dir) if (wakenet_model_paths or multinet_model_paths) else None
+        srmodels = process_sr_models(wakenet_model_paths, multinet_model_paths, nsnet_model_paths, temp_build_dir, assets_dir) if (wakenet_model_paths or multinet_model_paths or nsnet_model_paths) else None
         text_font = process_text_font(text_font_path, assets_dir) if text_font_path else None
         emoji_collection = process_emoji_collection(emoji_collection_path, assets_dir) if emoji_collection_path else None
         extra_files = process_extra_files(extra_files_path, assets_dir) if extra_files_path else None
@@ -844,10 +896,12 @@ def main():
     # Read SR models from sdkconfig
     wakenet_model_names = read_wakenet_from_sdkconfig(args.sdkconfig)
     multinet_model_names = read_multinet_from_sdkconfig(args.sdkconfig)
+    nsnet_model_names = read_nsnet_from_sdkconfig(args.sdkconfig)
     
     # Apply wake word logic to decide which models to package
     wakenet_model_paths = []
     multinet_model_paths = []
+    nsnet_model_paths = []
     
     # 1. Only package wakenet models if USE_ESP_WAKE_WORD=y or USE_AFE_WAKE_WORD=y
     if wake_word_config['use_esp_wake_word'] or wake_word_config['use_afe_wake_word']:
@@ -867,11 +921,17 @@ def main():
     elif multinet_model_names:
         print(f"  Note: Found multinet models {multinet_model_names} but USE_CUSTOM_WAKE_WORD is disabled, skipping")
     
+    # 4. Always package noise suppression models if selected
+    if nsnet_model_names:
+        nsnet_model_paths = get_nsnet_model_paths(nsnet_model_names, args.esp_sr_model_path)
+    
     # Print model information (only for models that will actually be packaged)
     if wakenet_model_paths:
         print(f"  wakenet models: {', '.join(wakenet_model_names)} (will be packaged)")
     if multinet_model_paths:
         print(f"  multinet models: {', '.join(multinet_model_names)} (will be packaged)")
+    if nsnet_model_paths:
+        print(f"  noise suppression models: {', '.join(nsnet_model_names)} (will be packaged)")
     
     # Get text font path if needed
     text_font_path = get_text_font_path(args.builtin_text_font, args.xiaozhi_fonts_path)
@@ -911,7 +971,7 @@ def main():
         print(f"  wake word threshold: {custom_wake_word_config['threshold']}")
     
     # Check if we have anything to build
-    if not wakenet_model_paths and not multinet_model_paths and not text_font_path and not emoji_collection_path and not extra_files_path and not multinet_model_info:
+    if not wakenet_model_paths and not multinet_model_paths and not nsnet_model_paths and not text_font_path and not emoji_collection_path and not extra_files_path and not multinet_model_info:
         print("Warning: No assets to build (no SR models, text font, emoji collection, extra files, or custom wake word)")
         # Create an empty assets.bin file
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -921,7 +981,7 @@ def main():
         return
     
     # Build the assets
-    success = build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font_path, emoji_collection_path, 
+    success = build_assets_integrated(wakenet_model_paths, multinet_model_paths, nsnet_model_paths, text_font_path, emoji_collection_path, 
                                      extra_files_path, args.output, multinet_model_info)
     
     if not success:

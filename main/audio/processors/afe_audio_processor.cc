@@ -38,40 +38,69 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
-    afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
-    afe_config->vad_mode = VAD_MODE_0;
-    afe_config->vad_min_noise_ms = 100;
+
+    // ========== AEC 回声消除 ==========
+    afe_config->aec_init = true;                      // 启用 AEC（重要！）
+    afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;   // 高性能模式
+    afe_config->aec_filter_length = 960;             // 滤波器长度，根据扬声器与麦克风距离调整
+
+    // ========== NS 噪声抑制 ==========
+    if (ns_model_name != nullptr) {
+        afe_config->ns_init = true;
+        afe_config->ns_model_name = ns_model_name;
+        afe_config->afe_ns_mode = AFE_NS_MODE_NET;    // 神经网络降噪
+        ESP_LOGI(TAG, "ns_init = true");
+    } else {
+        afe_config->ns_init = false;
+        ESP_LOGI(TAG, "ns_init = false");
+    }
+
+    // ========== VAD 语音活动检测 ==========
+    afe_config->vad_init = true;                       // 启用 VAD
+    afe_config->vad_mode = VAD_MODE_3;                 // MODE_3 平衡模式（推荐语音助手）
+    afe_config->vad_min_speech_ms = 100;              // 最小语音时长 100ms
+    afe_config->vad_min_noise_ms = 300;                // 最小静音时长 300ms（避免频繁切换）
+    afe_config->vad_delay_ms = 64;                    // 语音延迟，适当减小
     if (vad_model_name != nullptr) {
         afe_config->vad_model_name = vad_model_name;
     }
 
-    if (ns_model_name != nullptr) {
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = ns_model_name;
-        afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    } else {
-        afe_config->ns_init = false;
-    }
+    // ========== SE 语音增强 ==========
+    // 单麦无需 SE（SE 用于麦克风阵列）
+    // afe_config->se_init = false;
 
-    afe_config->agc_init = false;
-    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    // ========== AGC 自动增益 ==========
+    afe_config->agc_init = true;                       // 启用 AGC（语音助手推荐开启）
+    afe_config->agc_mode = AFE_AGC_MODE_WEBRTC;            // ASR 专用模式
+    afe_config->agc_target_level_dbfs = -3;            // 目标电平 -3dBFS
+    // afe_config->agc_compression_gain_db = 12;         // 压缩增益 12dB
 
-#ifdef CONFIG_USE_DEVICE_AEC
-    afe_config->aec_init = true;
-    afe_config->vad_init = false;
-#else
-    afe_config->aec_init = false;
-    afe_config->vad_init = true;
-#endif
+
+    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;// 打开后可能增加使用SRAM 5KB
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
-    xTaskCreatePinnedToCore([](void* arg) {
-        auto this_ = (AfeAudioProcessor*)arg;
-        this_->AudioProcessorTask();
-        vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL, 1);
+    static StackType_t* task_stack = nullptr;
+    static StaticTask_t task_buffer;
+
+    if (task_stack == nullptr) {
+        task_stack = (StackType_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+        if (task_stack == nullptr) {
+            ESP_LOGW(TAG, "Failed to allocate SPIRAM stack, falling back to internal");
+            task_stack = (StackType_t*)heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+    }
+
+    if (task_stack != nullptr) {
+        xTaskCreateStaticPinnedToCore([](void* arg) {
+            auto this_ = (AfeAudioProcessor*)arg;
+            this_->AudioProcessorTask();
+            vTaskDelete(NULL);
+        }, "audio_communication", 4096, this, 3, task_stack, &task_buffer, 1);
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate stack for audio processor task");
+    }
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
