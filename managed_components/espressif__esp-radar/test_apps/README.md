@@ -22,6 +22,17 @@ idf.py create-project-from-example "espressif/esp-radar=*:console_test"
 
 Then the example will be downloaded in current folder, you can check into it for build and flash.
 
+## Test app modes
+
+This test app supports both legacy single-peer mode and multi-peer mode (new peer APIs).
+
+- Legacy mode (default): uses `wifi_radar_cb` and only the default peer.
+- Multi-peer mode: uses `wifi_radar_cb_ex` and creates additional peers by MAC address via `esp_radar_new_peer`.
+
+You can switch modes in `idf.py menuconfig`:
+
+- `ESP Radar test app` -> `Enable multi-peer mode (use esp_radar_new_peer + wifi_radar_cb_ex)`
+
 > You can use this command to download other examples. Or you can download examples from esp-radar repository:
 
  - [connect_rainmaker](https://github.com/espressif/esp-csi/tree/master/examples/esp-radar/connect_rainmaker): Adding Wi-Fi CSI Functionality in ESP RainMaker

@@ -25,6 +25,47 @@ static const char *TAG_TRAIN                     = "esp_radar_train";
 #define CSI_DETECTION_EXIT_BIT      BIT0
 #define CSI_PREPROCESSING_EXIT_BIT  BIT1
 
+#ifndef ESP_RADAR_MAX_PEERS
+#define ESP_RADAR_MAX_PEERS 16
+#endif
+
+/* Runtime log output control for this module (per-tag) */
+static bool s_esp_radar_log_output_enabled = true;
+static bool s_esp_radar_saved_log_levels_valid = false;
+static const char *s_esp_radar_log_tags[] = {
+    "esp_radar",
+    "csi_detection_task",
+    "esp_radar_train",
+    "esp_radar_filter",
+    "esp_radar_csi_data_rebuild",
+    "esp_radar_csi_rx_cb",
+};
+static esp_log_level_t s_esp_radar_saved_log_levels[sizeof(s_esp_radar_log_tags) / sizeof(s_esp_radar_log_tags[0])] = {0};
+
+void esp_radar_set_log_output(bool enable, esp_log_level_t level)
+{
+    const size_t tag_num = sizeof(s_esp_radar_log_tags) / sizeof(s_esp_radar_log_tags[0]);
+
+    if (!enable) {
+        if (!s_esp_radar_log_output_enabled) {
+            return;
+        }
+        for (size_t i = 0; i < tag_num; ++i) {
+            s_esp_radar_saved_log_levels[i] = esp_log_level_get(s_esp_radar_log_tags[i]);
+            esp_log_level_set(s_esp_radar_log_tags[i], ESP_LOG_NONE);
+        }
+        s_esp_radar_saved_log_levels_valid = true;
+    } else {
+        for (size_t i = 0; i < tag_num; ++i) {
+            s_esp_radar_saved_log_levels[i] = level;
+            esp_log_level_set(s_esp_radar_log_tags[i], level);
+        }
+        s_esp_radar_saved_log_levels_valid = true;
+    }
+
+    s_esp_radar_log_output_enabled = enable;
+}
+
 #define RADAR_MOTION_DEC_WINDOW_DEFAULT      4
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
@@ -63,17 +104,19 @@ typedef struct {
  */
 typedef struct {
     EventGroupHandle_t          task_exit_group;     /**< Event group for task exit synchronization */
-    QueueHandle_t               csi_info_queue;      /**< Queue for CSI filtered information */
-    QueueHandle_t               csi_data_queue;      /**< Queue for CSI data buffer indices */
+    QueueHandle_t               csi_info_queue;      /**< Queue for CSI filtered information (peer dispatch) */
+    QueueHandle_t               csi_data_queue;      /**< Queue for CSI window indices (peer dispatch) */
     esp_radar_dec_config_t      dec_config;          /**< Decoder configuration */
     esp_radar_csi_config_t      csi_config;         /**< CSI configuration */
     esp_radar_wifi_config_t     wifi_config;        /**< WiFi configuration */
     esp_radar_espnow_config_t   espnow_config;       /**< ESP-NOW configuration */
     bool                        init_flag;          /**< Initialization flag */
     bool                        run_flag;           /**< Running flag */
-    csi_window_ctx_t            window_ctx;         /**< Ring buffer and window management context */
-    uint16_t                    subcarrier_len;     /**< Subcarrier length (dynamically calculated) */
-    csi_data_buff_t             *csi_data_buff;     /**< Pointer to CSI data buffer */
+    uint32_t                    buff_size;          /**< Ring buffer capacity shared by all peers */
+    uint32_t                    handle_window;      /**< Sliding window size shared by all peers */
+    struct esp_radar_peer      *default_peer;       /**< Default peer (for legacy APIs) */
+    struct esp_radar_peer      *peers[ESP_RADAR_MAX_PEERS]; /**< Registered peers */
+    size_t                      peer_count;         /**< Number of registered peers */
     bool                        lltf_bit_mode;      /**< LLTF bit mode flag */
 } radar_ctx_t;
 
@@ -124,14 +167,233 @@ typedef struct {
     float none_wander;                           /**< Current wander value for non-static environment */
     float static_wander;                         /**< Static environment wander value */
     uint16_t subcarrier_len;                     /**< Subcarrier length */
+    esp_radar_train_action_t last_action;        /**< Latest decision taken by the training pipeline */
 } radar_calibrate_t;
 
 static radar_ctx_t s_ctx = {0};
-static uint32_t s_csi_seq = 0;
-static uint32_t s_motion_dec_buff_num = 0;
-static radar_calibrate_t *s_radar_calibrate = NULL;
-static float s_waveform_wander_last = 1.0f;
+static portMUX_TYPE s_peer_mux = portMUX_INITIALIZER_UNLOCKED;
 
+typedef struct esp_radar_peer {
+    uint8_t mac[6];
+    bool is_wildcard;
+
+    /* Runtime state per peer */
+    csi_window_ctx_t  window_ctx;
+    uint16_t          subcarrier_len;
+    csi_data_buff_t  *csi_data_buff;
+
+    /* Motion detection buffers per peer */
+    float           **motion_dec_buff;
+    bool              motion_dec_buff_allocated;
+    uint32_t          motion_dec_buff_num;
+    uint32_t          motion_dec_capacity;
+
+    /* Training/calibration per peer */
+    radar_calibrate_t *cal;
+    float              waveform_wander_last;
+
+    /* Per-peer sequence counter */
+    uint32_t csi_seq;
+
+    /* Per-peer outlier filter state */
+    uint8_t outlier_streak;
+} esp_radar_peer_t;
+
+typedef struct {
+    esp_radar_peer_t *peer;
+    wifi_csi_filtered_info_t *filtered_info;
+} csi_info_msg_t;
+
+typedef struct {
+    esp_radar_peer_t *peer;
+    csi_data_buff_index_t index;
+} csi_window_msg_t;
+
+/* Forward declarations */
+static esp_err_t esp_radar_peer_ensure_ring_buffers(esp_radar_peer_t *peer);
+static esp_radar_peer_t *esp_radar_peer_find_exact_nolock(const uint8_t mac[6]);
+static esp_radar_peer_t *esp_radar_peer_find_wildcard_nolock(void);
+static bool esp_radar_mac_is_wildcard(const uint8_t mac[6]);
+static esp_err_t esp_radar_mac_addr_filter(wifi_csi_info_t *info);
+static esp_err_t esp_radar_sync_default_peer(const uint8_t mac[6]);
+static void esp_radar_peer_free_motion_dec_buffers(esp_radar_peer_t *peer);
+static void esp_radar_peer_free_ring_buffers(esp_radar_peer_t *peer);
+static void radar_calibrate_free_entries(radar_calibrate_t *cal);
+
+static esp_err_t esp_radar_peer_register(esp_radar_peer_t *peer)
+{
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = ESP_ERR_INVALID_SIZE;
+    portENTER_CRITICAL(&s_peer_mux);
+    /* Reject duplicate wildcard */
+    if (peer->is_wildcard && esp_radar_peer_find_wildcard_nolock()) {
+        ret = ESP_ERR_INVALID_RESPONSE;
+        goto OUT;
+    }
+    /* Reject duplicate exact */
+    if (!peer->is_wildcard && esp_radar_peer_find_exact_nolock(peer->mac)) {
+        ret = ESP_ERR_INVALID_RESPONSE;
+        goto OUT;
+    }
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        if (!s_ctx.peers[i]) {
+            s_ctx.peers[i] = peer;
+            s_ctx.peer_count++;
+            ret = ESP_OK;
+            goto OUT;
+        }
+    }
+OUT:
+    portEXIT_CRITICAL(&s_peer_mux);
+    return ret;
+}
+
+static void esp_radar_peer_unregister(esp_radar_peer_t *peer)
+{
+    if (!peer) {
+        return;
+    }
+    portENTER_CRITICAL(&s_peer_mux);
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        if (s_ctx.peers[i] == peer) {
+            s_ctx.peers[i] = NULL;
+            if (s_ctx.peer_count > 0) {
+                s_ctx.peer_count--;
+            }
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_peer_mux);
+}
+
+static esp_radar_peer_t *esp_radar_peer_create(const uint8_t mac[6])
+{
+    if (!mac) {
+        return NULL;
+    }
+    esp_radar_peer_t *peer = RADAR_MALLOC_RETRY(sizeof(esp_radar_peer_t));
+    memset(peer, 0, sizeof(esp_radar_peer_t));
+    memcpy(peer->mac, mac, 6);
+    peer->is_wildcard = esp_radar_mac_is_wildcard(mac);
+    peer->waveform_wander_last = 1.0f;
+    peer->csi_seq = 0;
+    peer->outlier_streak = 0;
+    return peer;
+}
+
+static esp_err_t esp_radar_sync_default_peer(const uint8_t mac[6])
+{
+    if (!mac) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ctx.default_peer) {
+        if (s_ctx.peer_count != 0) {
+            ESP_LOGI(TAG, "Skip legacy default peer creation because %u peer(s) already exist", (unsigned int)s_ctx.peer_count);
+            return ESP_OK;
+        }
+
+        esp_radar_handle_t h = NULL;
+        esp_err_t ret = esp_radar_new_peer(mac, &h);
+        if (ret != ESP_OK || !h) {
+            ESP_LOGW(TAG, "Failed to create default peer from filter_mac=" MACSTR, MAC2STR(mac));
+            return (ret != ESP_OK) ? ret : ESP_FAIL;
+        }
+        s_ctx.default_peer = (esp_radar_peer_t *)h;
+        ESP_LOGI(TAG, "Created default peer from filter_mac=" MACSTR, MAC2STR(mac));
+        return ESP_OK;
+    }
+
+    bool is_wildcard = esp_radar_mac_is_wildcard(mac);
+    if (s_ctx.default_peer->is_wildcard == is_wildcard &&
+            memcmp(s_ctx.default_peer->mac, mac, sizeof(s_ctx.default_peer->mac)) == 0) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = ESP_OK;
+    portENTER_CRITICAL(&s_peer_mux);
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *peer = s_ctx.peers[i];
+        if (!peer || peer == s_ctx.default_peer) {
+            continue;
+        }
+        if ((is_wildcard && peer->is_wildcard) ||
+                (!is_wildcard && !peer->is_wildcard && memcmp(peer->mac, mac, sizeof(peer->mac)) == 0)) {
+            ret = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+    }
+    if (ret == ESP_OK) {
+        memcpy(s_ctx.default_peer->mac, mac, sizeof(s_ctx.default_peer->mac));
+        s_ctx.default_peer->is_wildcard = is_wildcard;
+    }
+    portEXIT_CRITICAL(&s_peer_mux);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Synced default peer to filter_mac=" MACSTR, MAC2STR(mac));
+    } else {
+        ESP_LOGW(TAG, "Failed to sync default peer to filter_mac=" MACSTR, MAC2STR(mac));
+    }
+    return ret;
+}
+
+esp_err_t esp_radar_new_peer(const uint8_t mac[6], esp_radar_handle_t *out_handle)
+{
+    if (!mac || !out_handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ctx.init_flag) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_radar_peer_t *peer = esp_radar_peer_create(mac);
+    if (!peer) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = esp_radar_peer_register(peer);
+    if (ret != ESP_OK) {
+        RADAR_FREE(peer);
+        return ret;
+    }
+
+    if (s_ctx.run_flag) {
+        ret = esp_radar_peer_ensure_ring_buffers(peer);
+        if (ret != ESP_OK) {
+            esp_radar_peer_unregister(peer);
+            RADAR_FREE(peer);
+            return ret;
+        }
+    }
+
+    *out_handle = (esp_radar_handle_t)peer;
+    return ESP_OK;
+}
+
+esp_err_t esp_radar_del_peer(esp_radar_handle_t handle)
+{
+    esp_radar_peer_t *peer = (esp_radar_peer_t *)handle;
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_ctx.run_flag) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (peer == s_ctx.default_peer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_radar_peer_unregister(peer);
+    esp_radar_peer_free_motion_dec_buffers(peer);
+    esp_radar_peer_free_ring_buffers(peer);
+    if (peer->cal) {
+        radar_calibrate_free_entries(peer->cal);
+        RADAR_FREE(peer->cal);
+    }
+    RADAR_FREE(peer);
+    return ESP_OK;
+}
 static esp_err_t esp_radar_extract_rx_ctrl_info(const wifi_pkt_rx_ctrl_t *rx_ctrl, esp_radar_rx_ctrl_info_t *info)
 {
     if (!rx_ctrl || !info) {
@@ -209,6 +471,78 @@ static esp_err_t esp_radar_extract_rx_ctrl_info(const wifi_pkt_rx_ctrl_t *rx_ctr
     return ESP_OK;
 }
 
+static bool esp_radar_mac_is_wildcard(const uint8_t mac[6])
+{
+    return (mac && ADDR_IS_FULL(mac));
+}
+
+static esp_radar_peer_t *esp_radar_peer_find_exact_nolock(const uint8_t mac[6])
+{
+    if (!mac) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *p = s_ctx.peers[i];
+        if (p && !p->is_wildcard && memcmp(p->mac, mac, 6) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static esp_radar_peer_t *esp_radar_peer_find_wildcard_nolock(void)
+{
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *p = s_ctx.peers[i];
+        if (p && p->is_wildcard) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static esp_radar_peer_t *esp_radar_select_peer(const wifi_csi_info_t *info)
+{
+    if (!info) {
+        return NULL;
+    }
+
+    /* Legacy compatibility:
+     * If user only uses esp_radar_init() (no additional peers created),
+     * keep the original filtering behavior based on esp_radar_mac_addr_filter().
+     */
+    if (s_ctx.peer_count == 1 && s_ctx.default_peer) {
+        if (esp_radar_mac_addr_filter((wifi_csi_info_t *)info) != ESP_OK) {
+            return NULL;
+        }
+        return s_ctx.default_peer;
+    }
+
+    /* Destination MAC filtering (shared config) */
+    if (s_ctx.csi_config.filter_dmac_flag && memcmp(info->dmac, s_ctx.csi_config.filter_dmac, 6) != 0) {
+        ESP_LOGD("esp_radar_filter", "Dest MAC mismatch - dmac: " MACSTR ", filter_dmac: " MACSTR,
+                 MAC2STR(info->dmac), MAC2STR(s_ctx.csi_config.filter_dmac));
+        return NULL;
+    }
+
+#if WIFI_CSI_SEND_NULL_DATA_ENABLE
+    /* Legacy behavior: when filter_mac is empty, only accept NULL data packets */
+    if (ADDR_IS_EMPTY(s_ctx.csi_config.filter_mac) && info->payload_len != 14) {
+        ESP_LOGD("esp_radar_filter", "Not null data packet - payload_len: %d", info->payload_len);
+        return NULL;
+    }
+#endif
+
+    esp_radar_peer_t *peer = NULL;
+    portENTER_CRITICAL(&s_peer_mux);
+    peer = esp_radar_peer_find_exact_nolock(info->mac);
+    if (!peer) {
+        peer = esp_radar_peer_find_wildcard_nolock();
+    }
+    portEXIT_CRITICAL(&s_peer_mux);
+    return peer;
+}
+
 static esp_err_t esp_radar_mac_addr_filter(wifi_csi_info_t *info)
 {
     static const char *TAG_FILTER = "esp_radar_filter";
@@ -219,7 +553,7 @@ static esp_err_t esp_radar_mac_addr_filter(wifi_csi_info_t *info)
 #endif
        ) {
         if ((ADDR_IS_EMPTY(s_ctx.csi_config.filter_mac) && info->payload_len != 14)) {
-            ESP_LOGD(TAG_FILTER, "Not null data packet - payload_len: %d", info->payload_len);
+            ESP_LOGI(TAG_FILTER, "Not null data packet - payload_len: %d", info->payload_len);
             return ESP_FAIL;
         }
         ESP_LOGD(TAG_FILTER, "Source MAC mismatch - mac: " MACSTR ", filter_mac: " MACSTR,  MAC2STR(info->mac), MAC2STR(s_ctx.csi_config.filter_mac));
@@ -231,20 +565,6 @@ static esp_err_t esp_radar_mac_addr_filter(wifi_csi_info_t *info)
         return ESP_FAIL;
     }
 
-    return ESP_OK;
-}
-
-static esp_err_t esp_radar_check_timestamp_interval(uint32_t timestamp)
-{
-    static uint32_t s_last_timestamp = 0;
-
-    uint32_t min_interval_us = s_ctx.csi_config.csi_recv_interval * 1000 / 5;
-
-    if (timestamp - s_last_timestamp <= min_interval_us) {
-        return ESP_FAIL;
-    }
-
-    s_last_timestamp = timestamp;
     return ESP_OK;
 }
 
@@ -359,7 +679,9 @@ static void esp_radar_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
-    if (esp_radar_mac_addr_filter(info) != ESP_OK) {
+    /* Select peer to dispatch this packet */
+    esp_radar_peer_t *peer = esp_radar_select_peer(info);
+    if (!peer) {
         return;
     }
 
@@ -372,8 +694,7 @@ static void esp_radar_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     wifi_csi_filtered_info_t *filtered_info = NULL;
     ESP_RETURN_VOID_ON_ERROR(esp_radar_rebuild_csi_data(info, &rx_ctrl_info, &filtered_info), TAG_CB, "Failed to filter CSI data");
 
-    uint32_t seq = s_csi_seq++;
-    filtered_info->seq_id = seq;
+    filtered_info->seq_id = peer->csi_seq++;
     filtered_info->info = info;
 
     float compensate_gain = 0;
@@ -395,9 +716,15 @@ static void esp_radar_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
             ESP_LOGW(TAG_CB, "esp_radar not running, CSI data dropped");
         }
         RADAR_FREE(filtered_info);
-    } else if (!s_ctx.csi_info_queue || xQueueSend(s_ctx.csi_info_queue, &filtered_info, 0) == pdFALSE) {
-        ESP_LOGW(TAG_CB, "Failed to send CSI data to queue, data dropped");
-        RADAR_FREE(filtered_info);
+    } else {
+        csi_info_msg_t msg = {
+            .peer = peer,
+            .filtered_info = filtered_info,
+        };
+        if (!s_ctx.csi_info_queue || xQueueSend(s_ctx.csi_info_queue, &msg, 0) == pdFALSE) {
+            ESP_LOGW(TAG_CB, "Failed to send CSI data to queue, data dropped");
+            RADAR_FREE(filtered_info);
+        }
     }
 }
 #define my_hypotf(a, b) sqrtf((a) * (a) + (b) * (b))
@@ -458,21 +785,24 @@ static esp_err_t esp_radar_get_ltf_data(const wifi_csi_filtered_info_t *filtered
     return ESP_OK;
 }
 
-static esp_err_t csi_outlier_filter_process(uint16_t subcarrier_len)
+static esp_err_t csi_outlier_filter_process(esp_radar_peer_t *peer, uint16_t subcarrier_len)
 {
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
     const uint8_t threshold = s_ctx.dec_config.outliers_threshold;
-    uint32_t curr_seq = s_ctx.window_ctx.next_seq;
+    uint32_t curr_seq = peer->window_ctx.next_seq;
     const uint8_t max_streak = 3;
-    static uint8_t outlier_streak = 0;
+    uint8_t *outlier_streak = &peer->outlier_streak;
     if (curr_seq < 3) {
-        outlier_streak = 0;
+        *outlier_streak = 0;
         return ESP_OK;
     }
 
-    float *hist0 = s_ctx.csi_data_buff->amplitude[(curr_seq - 3) % s_ctx.window_ctx.buff_size];
-    float *hist1 = s_ctx.csi_data_buff->amplitude[(curr_seq - 2) % s_ctx.window_ctx.buff_size];
-    float *hist2 = s_ctx.csi_data_buff->amplitude[(curr_seq - 1) % s_ctx.window_ctx.buff_size];
-    float *curr  = s_ctx.csi_data_buff->amplitude[curr_seq % s_ctx.window_ctx.buff_size];
+    float *hist0 = peer->csi_data_buff->amplitude[(curr_seq - 3) % peer->window_ctx.buff_size];
+    float *hist1 = peer->csi_data_buff->amplitude[(curr_seq - 2) % peer->window_ctx.buff_size];
+    float *hist2 = peer->csi_data_buff->amplitude[(curr_seq - 1) % peer->window_ctx.buff_size];
+    float *curr  = peer->csi_data_buff->amplitude[curr_seq % peer->window_ctx.buff_size];
 
     uint32_t outliers_count = 0;
 
@@ -487,14 +817,14 @@ static esp_err_t csi_outlier_filter_process(uint16_t subcarrier_len)
     bool is_outlier_frame = (outliers_count >= subcarrier_len / 2);
 
     if (!is_outlier_frame) {
-        outlier_streak = 0;
+        *outlier_streak = 0;
         return ESP_OK;
     }
-    outlier_streak++;
+    (*outlier_streak)++;
 
-    if (outlier_streak >= max_streak) {
-        ESP_LOGD(TAG, "Consecutive outliers (%u), accept as new baseline, seq=%lu", outlier_streak, curr_seq);
-        outlier_streak = 0;
+    if (*outlier_streak >= max_streak) {
+        ESP_LOGW(TAG, "Consecutive outliers (%u), accept as new baseline, seq=%lu", *outlier_streak, curr_seq);
+        *outlier_streak = 0;
         return ESP_OK;
     }
     ESP_LOGD(TAG, "Soft-updated outlier frame: %lu/%d at seq=%lu", outliers_count, subcarrier_len, curr_seq);
@@ -502,88 +832,96 @@ static esp_err_t csi_outlier_filter_process(uint16_t subcarrier_len)
     return ESP_OK;
 }
 
-static esp_err_t csi_window_update(csi_data_buff_index_t *buff_index)
+static esp_err_t csi_window_update(esp_radar_peer_t *peer, csi_data_buff_index_t *buff_index)
 {
-    if (!s_ctx.csi_data_buff || s_ctx.window_ctx.buff_size == 0) {
+    if (!peer || !peer->csi_data_buff || peer->window_ctx.buff_size == 0) {
         return ESP_FAIL;
     }
 
-    buff_index->begin  = s_ctx.window_ctx.window_start_seq % s_ctx.window_ctx.buff_size;
-    buff_index->end    = s_ctx.window_ctx.next_seq % s_ctx.window_ctx.buff_size;
-    buff_index->window = s_ctx.window_ctx.next_seq - s_ctx.window_ctx.window_start_seq;
+    buff_index->begin  = peer->window_ctx.window_start_seq % peer->window_ctx.buff_size;
+    buff_index->end    = peer->window_ctx.next_seq % peer->window_ctx.buff_size;
+    buff_index->window = peer->window_ctx.next_seq - peer->window_ctx.window_start_seq;
 
-    int32_t spent_time = s_ctx.csi_data_buff->timestamp[buff_index->end] - s_ctx.csi_data_buff->timestamp[buff_index->begin];
-    int32_t time_tamp  = s_ctx.csi_data_buff->timestamp[buff_index->end] - (int32_t)(s_ctx.window_ctx.last_timestamp);
+    int32_t spent_time = peer->csi_data_buff->timestamp[buff_index->end] - peer->csi_data_buff->timestamp[buff_index->begin];
+    int32_t time_tamp  = peer->csi_data_buff->timestamp[buff_index->end] - (int32_t)(peer->window_ctx.last_timestamp);
     int32_t strict_ts_limit = (int32_t)(s_ctx.dec_config.csi_handle_time / 2);
-    int32_t ts_limit = s_ctx.window_ctx.ts_delta_relaxed ? (int32_t)s_ctx.dec_config.csi_handle_time : strict_ts_limit;
+    int32_t ts_limit = peer->window_ctx.ts_delta_relaxed ? (int32_t)s_ctx.dec_config.csi_handle_time : strict_ts_limit;
 
     esp_err_t ret = ESP_FAIL;
 
-    if (s_ctx.window_ctx.ts_delta_relaxed && time_tamp >= 0 && time_tamp <= strict_ts_limit) {
-        s_ctx.window_ctx.ts_delta_relaxed = false;
-        ESP_LOGD(TAG, "Timestamp delta recovered, restore strict threshold: ts_delta=%d, strict_limit=%d",
+    if (peer->window_ctx.ts_delta_relaxed && time_tamp >= 0 && time_tamp <= strict_ts_limit) {
+        peer->window_ctx.ts_delta_relaxed = false;
+        ESP_LOGI(TAG, "Timestamp delta recovered, restore strict threshold: ts_delta=%d, strict_limit=%d",
                  time_tamp, strict_ts_limit);
     }
 
     if (time_tamp < 0 || time_tamp > ts_limit) {
-        ESP_LOGD(TAG, "Timestamp delta out of range, clear window: ts_delta=%d, ts_limit=%d, spent_time=%d, csi_handle_time=%d, end=%d, last=%d, window=%d, handle_window=%d",
-                 time_tamp, ts_limit, spent_time, s_ctx.dec_config.csi_handle_time, s_ctx.csi_data_buff->timestamp[buff_index->end], s_ctx.window_ctx.last_timestamp,
-                 buff_index->window, s_ctx.window_ctx.handle_window);
+        ESP_LOGI(TAG, "Timestamp delta out of range, clear window: ts_delta=%d, ts_limit=%d, spent_time=%d, csi_handle_time=%d, end=%d, last=%d, window=%d, handle_window=%d",
+                 time_tamp, ts_limit, spent_time, s_ctx.dec_config.csi_handle_time, peer->csi_data_buff->timestamp[buff_index->end], peer->window_ctx.last_timestamp,
+                 buff_index->window, peer->window_ctx.handle_window);
 
         if (time_tamp > strict_ts_limit) {
-            s_ctx.window_ctx.ts_delta_relaxed = true;
+            peer->window_ctx.ts_delta_relaxed = true;
         }
-        s_ctx.window_ctx.window_start_seq = s_ctx.window_ctx.next_seq;
+        peer->window_ctx.window_start_seq = peer->window_ctx.next_seq;
         goto UPDATE_STATE;
     }
 
-    if (spent_time >= (int32_t)(s_ctx.dec_config.csi_handle_time * 2) || buff_index->window >= s_ctx.window_ctx.handle_window / 2) {
-        if (buff_index->window < s_ctx.window_ctx.handle_window / 3) {
-            s_ctx.window_ctx.window_start_seq = s_ctx.window_ctx.next_seq;
-            ESP_LOGD(TAG, "buff_index.window: %d, spent_time: %d, csi_handle_time: %d, handle_window: %d",
-                     buff_index->window, spent_time, s_ctx.dec_config.csi_handle_time, s_ctx.window_ctx.handle_window);
+    if (spent_time >= (int32_t)(s_ctx.dec_config.csi_handle_time * 2) || buff_index->window >= peer->window_ctx.handle_window / 2) {
+        if (buff_index->window < peer->window_ctx.handle_window / 3) {
+            peer->window_ctx.window_start_seq = peer->window_ctx.next_seq;
+            ESP_LOGI(TAG, "Flush window but drop: too small, window=%d, spent_time=%d, csi_handle_time=%d, handle_window=%d",
+                     buff_index->window, spent_time, s_ctx.dec_config.csi_handle_time, peer->window_ctx.handle_window);
             goto UPDATE_STATE;
         }
-        ESP_LOGD(TAG, "buff_index.window: %d, time_tamp: %d, spent_time: %d, csi_handle_time: %d, handle_window: %d,buff_index-begin: %d, buff_index-end: %d",
-                 buff_index->window, time_tamp, spent_time, s_ctx.dec_config.csi_handle_time, s_ctx.window_ctx.handle_window, buff_index->begin, buff_index->end);
+        ESP_LOGD(TAG, "Flush half window ok. window=%d, ts_delta=%d, spent_time=%d, csi_handle_time=%d, handle_window=%d, begin=%d, end=%d",
+                 buff_index->window, time_tamp, spent_time, s_ctx.dec_config.csi_handle_time, peer->window_ctx.handle_window, buff_index->begin, buff_index->end);
         ret = ESP_OK;
-        s_ctx.window_ctx.window_start_seq += buff_index->window / 2;
+        peer->window_ctx.window_start_seq += buff_index->window / 2;
     }
 
 UPDATE_STATE:
-    s_ctx.window_ctx.last_timestamp = s_ctx.csi_data_buff->timestamp[buff_index->end];
-    s_ctx.window_ctx.next_seq++;
+    peer->window_ctx.last_timestamp = peer->csi_data_buff->timestamp[buff_index->end];
+    peer->window_ctx.next_seq++;
     return ret;
 }
 
-static void csi_prepare_amplitude(uint16_t subcarrier_len)
+static void csi_prepare_amplitude(esp_radar_peer_t *peer, uint16_t subcarrier_len)
 {
-    size_t pointer_bytes = (size_t)s_ctx.window_ctx.buff_size * sizeof(float *);
-    size_t data_bytes    = (size_t)s_ctx.window_ctx.buff_size * subcarrier_len * sizeof(float);
+    if (!peer || !peer->csi_data_buff) {
+        return;
+    }
+    size_t pointer_bytes = (size_t)peer->window_ctx.buff_size * sizeof(float *);
+    size_t data_bytes    = (size_t)peer->window_ctx.buff_size * subcarrier_len * sizeof(float);
     size_t total_bytes   = pointer_bytes + data_bytes;
     uint8_t *amplitude_block = RADAR_MALLOC_RETRY(total_bytes);
     memset(amplitude_block, 0, total_bytes);
 
-    s_ctx.csi_data_buff->amplitude = (float **)amplitude_block;
+    peer->csi_data_buff->amplitude = (float **)amplitude_block;
     float *data_base = (float *)(amplitude_block + pointer_bytes);
-    for (uint32_t i = 0; i < s_ctx.window_ctx.buff_size; i++) {
-        s_ctx.csi_data_buff->amplitude[i] = data_base + (i * subcarrier_len);
+    for (uint32_t i = 0; i < peer->window_ctx.buff_size; i++) {
+        peer->csi_data_buff->amplitude[i] = data_base + (i * subcarrier_len);
     }
 }
 
-static void csi_write_frame_to_ring(const void *ltf_data, uint16_t subcarrier_len, wifi_csi_filtered_info_t *filtered_info)
+static inline float csi_transform_amplitude(float amplitude)
 {
-    if (!s_ctx.csi_data_buff || !s_ctx.csi_data_buff->amplitude ||
-            !s_ctx.csi_data_buff->seq_id || !s_ctx.csi_data_buff->timestamp) {
+    return s_ctx.dec_config.amplitude_log_enabled ? log10f(amplitude) : amplitude;
+}
+
+static void csi_write_frame_to_ring(esp_radar_peer_t *peer, const void *ltf_data, uint16_t subcarrier_len, wifi_csi_filtered_info_t *filtered_info)
+{
+    if (!peer || !peer->csi_data_buff || !peer->csi_data_buff->amplitude ||
+            !peer->csi_data_buff->seq_id || !peer->csi_data_buff->timestamp) {
         return;
     }
 
-    uint32_t write_index = s_ctx.window_ctx.next_seq % s_ctx.window_ctx.buff_size;
+    uint32_t write_index = peer->window_ctx.next_seq % peer->window_ctx.buff_size;
 
-    s_ctx.csi_data_buff->seq_id[write_index] = filtered_info->seq_id;
-    s_ctx.csi_data_buff->timestamp[write_index] = filtered_info->rx_ctrl_info.timestamp / 1000;
+    peer->csi_data_buff->seq_id[write_index] = filtered_info->seq_id;
+    peer->csi_data_buff->timestamp[write_index] = filtered_info->rx_ctrl_info.timestamp / 1000;
 
-    float *csi_data = s_ctx.csi_data_buff->amplitude[write_index];
+    float *csi_data = peer->csi_data_buff->amplitude[write_index];
     const uint8_t step = s_ctx.dec_config.sub_carrier_step_size;
     const uint8_t *data = (const uint8_t *)ltf_data;
 
@@ -595,18 +933,112 @@ static void csi_write_frame_to_ring(const void *ltf_data, uint16_t subcarrier_le
              */
             int16_t imag = ((int16_t)(((int16_t)data[i * step * 4 + 1]) << 12) >> 4 | (uint8_t)data[i * step * 4]) >> 4;
             int16_t real = ((int16_t)(((int16_t)data[i * step * 4 + 3]) << 12) >> 4 | (uint8_t)data[i * step * 4 + 2]) >> 4;
-            csi_data[i] = my_hypotf(real, imag);
+            csi_data[i] = csi_transform_amplitude(my_hypotf(real, imag));
         } else {
-            csi_data[i] = my_hypotf(((const int8_t *)ltf_data)[i * step * 2], ((const int8_t *)ltf_data)[i * step * 2 + 1]);
+            csi_data[i] = csi_transform_amplitude(my_hypotf(((const int8_t *)ltf_data)[i * step * 2],
+                                                            ((const int8_t *)ltf_data)[i * step * 2 + 1]));
         }
     }
 }
 
+static void esp_radar_peer_free_motion_dec_buffers(esp_radar_peer_t *peer)
+{
+    if (!peer) {
+        return;
+    }
+    if (!peer->motion_dec_buff) {
+        peer->motion_dec_buff_allocated = false;
+        peer->motion_dec_buff_num = 0;
+        peer->motion_dec_capacity = 0;
+        return;
+    }
+    uint32_t cap = peer->motion_dec_capacity;
+    for (uint32_t i = 0; i < cap; ++i) {
+        if (peer->motion_dec_buff[i]) {
+            RADAR_FREE(peer->motion_dec_buff[i]);
+            peer->motion_dec_buff[i] = NULL;
+        }
+    }
+    RADAR_FREE(peer->motion_dec_buff);
+    peer->motion_dec_buff = NULL;
+    peer->motion_dec_buff_allocated = false;
+    peer->motion_dec_buff_num = 0;
+    peer->motion_dec_capacity = 0;
+}
+
+static void esp_radar_peer_free_ring_buffers(esp_radar_peer_t *peer)
+{
+    if (!peer || !peer->csi_data_buff) {
+        return;
+    }
+    RADAR_FREE(peer->csi_data_buff->amplitude);
+    RADAR_FREE(peer->csi_data_buff->timestamp);
+    RADAR_FREE(peer->csi_data_buff->seq_id);
+    RADAR_FREE(peer->csi_data_buff);
+    peer->csi_data_buff = NULL;
+    peer->subcarrier_len = 0;
+    memset(&peer->window_ctx, 0, sizeof(peer->window_ctx));
+    peer->csi_seq = 0;
+    peer->outlier_streak = 0;
+}
+
+static esp_err_t esp_radar_peer_ensure_ring_buffers(esp_radar_peer_t *peer)
+{
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (peer->csi_data_buff) {
+        return ESP_OK;
+    }
+    if (s_ctx.buff_size == 0 || s_ctx.handle_window == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    peer->csi_data_buff = RADAR_MALLOC_RETRY(sizeof(csi_data_buff_t));
+    memset(peer->csi_data_buff, 0, sizeof(csi_data_buff_t));
+
+    peer->window_ctx.handle_window     = s_ctx.handle_window;
+    peer->window_ctx.buff_size         = s_ctx.buff_size;
+    peer->window_ctx.window_start_seq  = 0;
+    peer->window_ctx.next_seq          = 0;
+    peer->window_ctx.last_timestamp    = 0;
+    peer->window_ctx.ts_delta_relaxed  = false;
+
+    peer->csi_data_buff->amplitude = NULL;
+    peer->csi_data_buff->timestamp = RADAR_MALLOC_RETRY(peer->window_ctx.buff_size * sizeof(uint32_t));
+    memset(peer->csi_data_buff->timestamp, 0, peer->window_ctx.buff_size * sizeof(uint32_t));
+    peer->csi_data_buff->seq_id = RADAR_MALLOC_RETRY(peer->window_ctx.buff_size * sizeof(uint32_t));
+    memset(peer->csi_data_buff->seq_id, 0, peer->window_ctx.buff_size * sizeof(uint32_t));
+
+    peer->subcarrier_len = 0;
+    peer->csi_seq = 0;
+    peer->outlier_streak = 0;
+    esp_radar_peer_free_motion_dec_buffers(peer);
+    return ESP_OK;
+}
+
 static void csi_preprocessing_task(void *arg)
 {
+    csi_info_msg_t msg = {0};
     wifi_csi_filtered_info_t *filtered_info = NULL;
+    esp_radar_peer_t *peer = NULL;
 
-    while (xQueueReceive(s_ctx.csi_info_queue, &filtered_info, portMAX_DELAY) && s_ctx.run_flag) {
+    while (xQueueReceive(s_ctx.csi_info_queue, &msg, portMAX_DELAY)) {
+        peer = msg.peer;
+        filtered_info = msg.filtered_info;
+        if (!s_ctx.run_flag) {
+            if (filtered_info) {
+                RADAR_FREE(filtered_info);
+            }
+            break;
+        }
+        if (!peer || !filtered_info) {
+            continue;
+        }
+        if (esp_radar_peer_ensure_ring_buffers(peer) != ESP_OK) {
+            ESP_LOGW(TAG, "Peer ring buffer not ready (peer=" MACSTR "), frame dropped", MAC2STR(peer->mac));
+            goto FREE_MEM;
+        }
         void *ltf_data = NULL;
         uint16_t ltf_len = 0;
         uint16_t subcarrier_len = 0;
@@ -616,27 +1048,31 @@ static void csi_preprocessing_task(void *arg)
 
         uint8_t component_bytes = (filtered_info->data_type == WIFI_CSI_DATA_TYPE_INT16) ? sizeof(int16_t) : sizeof(int8_t);
         subcarrier_len = (uint16_t)((ltf_len / (2U * component_bytes)) / s_ctx.dec_config.sub_carrier_step_size);
-        if (s_ctx.subcarrier_len == 0) {
-            s_ctx.subcarrier_len = subcarrier_len;
-            csi_prepare_amplitude(subcarrier_len);
-            ESP_LOGI(TAG, "First frame detected: type=%d, LTF length=%d, subcarrier length=%d, step size=%d, allocated buffer: %d x %d",
-                     s_ctx.dec_config.ltf_type, ltf_len, subcarrier_len, s_ctx.dec_config.sub_carrier_step_size, s_ctx.window_ctx.buff_size, subcarrier_len);
-        } else if (subcarrier_len != s_ctx.subcarrier_len) {
-            ESP_LOGE(TAG, "Frame length mismatch detected! Expected type=%d, subcarrier_len=%d, got=%d (LTF len=%d). Discarding frame.",
-                     s_ctx.dec_config.ltf_type, s_ctx.subcarrier_len, subcarrier_len, ltf_len);
+        if (peer->subcarrier_len == 0) {
+            peer->subcarrier_len = subcarrier_len;
+            csi_prepare_amplitude(peer, subcarrier_len);
+            ESP_LOGI(TAG, "First frame detected (peer=" MACSTR "): type=%d, LTF length=%d, subcarrier length=%d, step size=%d, allocated buffer: %lu x %d",
+                     MAC2STR(peer->mac), s_ctx.dec_config.ltf_type, ltf_len, subcarrier_len, s_ctx.dec_config.sub_carrier_step_size, peer->window_ctx.buff_size, subcarrier_len);
+        } else if (subcarrier_len != peer->subcarrier_len) {
+            ESP_LOGE(TAG, "Frame length mismatch detected (peer=" MACSTR ")! Expected type=%d, subcarrier_len=%d, got=%d (LTF len=%d). Discarding frame.",
+                     MAC2STR(peer->mac), s_ctx.dec_config.ltf_type, peer->subcarrier_len, subcarrier_len, ltf_len);
             goto FREE_MEM;
         }
 
-        csi_write_frame_to_ring(ltf_data, subcarrier_len, filtered_info);
+        csi_write_frame_to_ring(peer, ltf_data, subcarrier_len, filtered_info);
         if (s_ctx.dec_config.outliers_threshold > 0) {
-            if (csi_outlier_filter_process(subcarrier_len) != ESP_OK) {
+            if (csi_outlier_filter_process(peer, subcarrier_len) != ESP_OK) {
                 goto FREE_MEM;
             }
         }
 
         csi_data_buff_index_t buff_index = {0};
-        if (csi_window_update(&buff_index) == ESP_OK) {
-            if (!s_ctx.csi_data_queue || xQueueSend(s_ctx.csi_data_queue, &buff_index, portMAX_DELAY) == pdFALSE) {
+        if (csi_window_update(peer, &buff_index) == ESP_OK) {
+            csi_window_msg_t win_msg = {
+                .peer = peer,
+                .index = buff_index,
+            };
+            if (!s_ctx.csi_data_queue || xQueueSend(s_ctx.csi_data_queue, &win_msg, portMAX_DELAY) == pdFALSE) {
                 ESP_LOGW(TAG, "The buffer is full");
             }
         }
@@ -675,68 +1111,154 @@ static void radar_calibrate_reset_stats(radar_calibrate_t *cal)
     cal->none_wander = 0.0f;
     cal->static_wander = 0.0f;
     cal->subcarrier_len = 0;
+    cal->last_action = ESP_RADAR_TRAIN_ACTION_IDLE;
+}
+
+static esp_radar_train_status_t radar_train_status_to_public(radar_calibrate_status_t status)
+{
+    switch (status) {
+    case RADAR_CALIBRATE_PROGRESS:
+        return ESP_RADAR_TRAIN_STATUS_PROGRESS;
+    case RADAR_CALIBRATE_COMPLETE:
+        return ESP_RADAR_TRAIN_STATUS_COMPLETE;
+    case RADAR_CALIBRATE_NO:
+    default:
+        return ESP_RADAR_TRAIN_STATUS_NONE;
+    }
+}
+
+esp_err_t esp_radar_train_start_ex(esp_radar_handle_t handle)
+{
+    esp_radar_peer_t *peer = (esp_radar_peer_t *)handle;
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!peer->cal) {
+        peer->cal = RADAR_MALLOC_RETRY(sizeof(radar_calibrate_t));
+        if (!peer->cal) {
+            return ESP_ERR_NO_MEM;
+        }
+        memset(peer->cal, 0, sizeof(radar_calibrate_t));
+        peer->cal->data_num = 0;
+    }
+
+    radar_calibrate_t *cal = peer->cal;
+
+    radar_calibrate_reset_stats(cal);
+    /* Start a new training session: reset sample counter while keeping allocated buffers for reuse */
+    cal->data_num = 0;
+    cal->calibrate_status = RADAR_CALIBRATE_PROGRESS;
+    cal->last_action = ESP_RADAR_TRAIN_ACTION_IDLE;
+    peer->waveform_wander_last = 1.0f;
+    peer->motion_dec_buff_num = 0;
+    ESP_LOGI(TAG_TRAIN, "esp_radar_train_start (peer=" MACSTR ")", MAC2STR(peer->mac));
+    return ESP_OK;
+}
+
+esp_err_t esp_radar_train_remove_ex(esp_radar_handle_t handle)
+{
+    esp_radar_peer_t *peer = (esp_radar_peer_t *)handle;
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!peer->cal) {
+        return ESP_OK;
+    }
+
+    radar_calibrate_free_entries(peer->cal);
+    radar_calibrate_reset_stats(peer->cal);
+    peer->cal->data_num = 0;
+    peer->cal->calibrate_status = RADAR_CALIBRATE_NO;
+    peer->cal->last_action = ESP_RADAR_TRAIN_ACTION_IDLE;
+    peer->waveform_wander_last = 0.0f;
+    ESP_LOGI(TAG_TRAIN, "esp_radar_train_remove (peer=" MACSTR ")", MAC2STR(peer->mac));
+    return ESP_OK;
+}
+
+esp_err_t esp_radar_train_stop_ex(esp_radar_handle_t handle, float *wander_threshold, float *jitter_threshold)
+{
+    esp_radar_peer_t *peer = (esp_radar_peer_t *)handle;
+    /* Make output deterministic even on failure */
+    if (wander_threshold) {
+        *wander_threshold = 0.0f;
+    }
+    if (jitter_threshold) {
+        *jitter_threshold = 0.0f;
+    }
+    if (!peer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!peer->cal) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (!peer->cal->data_num || peer->cal->none_wander_count == 0.0f) {
+        /* Exit training mode even if thresholds can't be produced, to avoid being stuck in PROGRESS */
+        peer->cal->calibrate_status = RADAR_CALIBRATE_NO;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    peer->cal->calibrate_status = RADAR_CALIBRATE_COMPLETE;
+    /* Same scale as esp_radar_motion_dec: wander/jitter in [0,1], smaller = more stable. */
+    float wander_threshold_value = peer->cal->none_wander_sum / peer->cal->none_wander_count;
+    float jitter_threshold_value = peer->cal->static_wander;
+    if (wander_threshold) {
+        *wander_threshold = wander_threshold_value;
+    }
+    if (jitter_threshold) {
+        *jitter_threshold = jitter_threshold_value;
+    }
+
+    ESP_LOGI(TAG_TRAIN, "esp_radar_train_stop (peer=" MACSTR "), data_num=%u, sum=%.6f, count=%.0f, wander_th=%.6f, jitter_th=%.6f",
+             MAC2STR(peer->mac), (unsigned int)peer->cal->data_num, peer->cal->none_wander_sum, peer->cal->none_wander_count,
+             wander_threshold_value, jitter_threshold_value);
+    return ESP_OK;
 }
 
 esp_err_t esp_radar_train_start(void)
 {
-    if (!s_radar_calibrate) {
-        s_radar_calibrate = RADAR_MALLOC_RETRY(sizeof(radar_calibrate_t));
-        memset(s_radar_calibrate, 0, sizeof(radar_calibrate_t));
-        s_radar_calibrate->data_num = 0;
+    if (!s_ctx.default_peer) {
+        return ESP_ERR_INVALID_STATE;
     }
-
-    radar_calibrate_reset_stats(s_radar_calibrate);
-    s_radar_calibrate->calibrate_status = RADAR_CALIBRATE_PROGRESS;
-    s_waveform_wander_last = 1.0f;
-    s_motion_dec_buff_num = 0;
-    ESP_LOGI(TAG_TRAIN, "esp_radar_train_start");
-    return ESP_OK;
+    return esp_radar_train_start_ex((esp_radar_handle_t)s_ctx.default_peer);
 }
 
 esp_err_t esp_radar_train_remove(void)
 {
-    if (!s_radar_calibrate) {
-        return ESP_OK;
+    if (!s_ctx.default_peer) {
+        return ESP_ERR_INVALID_STATE;
     }
-
-    radar_calibrate_free_entries(s_radar_calibrate);
-    radar_calibrate_reset_stats(s_radar_calibrate);
-    s_radar_calibrate->data_num = 0;
-    s_radar_calibrate->calibrate_status = RADAR_CALIBRATE_NO;
-    s_waveform_wander_last = 0.0f;
-    ESP_LOGI(TAG_TRAIN, "esp_radar_train_remove");
-    return ESP_OK;
+    return esp_radar_train_remove_ex((esp_radar_handle_t)s_ctx.default_peer);
 }
 
 esp_err_t esp_radar_train_stop(float *wander_threshold, float *jitter_threshold)
 {
-    if (!s_radar_calibrate) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (!s_radar_calibrate->data_num || s_radar_calibrate->none_wander_count == 0.0f) {
+    if (!s_ctx.default_peer) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    s_radar_calibrate->calibrate_status = RADAR_CALIBRATE_COMPLETE;
-
-    if (wander_threshold) {
-        *wander_threshold = 1.0f - (s_radar_calibrate->none_wander_sum / s_radar_calibrate->none_wander_count);
-    }
-    if (jitter_threshold) {
-        *jitter_threshold = 1.0f - s_radar_calibrate->static_wander;
-    }
-
-    ESP_LOGI(TAG_TRAIN, "esp_radar_train_stop");
-    return ESP_OK;
+    return esp_radar_train_stop_ex((esp_radar_handle_t)s_ctx.default_peer, wander_threshold, jitter_threshold);
 }
 
-static esp_err_t csi_detection_compute_motion_dec(uint16_t cols, const csi_data_buff_index_t *buff_index, float *motion_dec_buff_current)
+esp_err_t esp_radar_train_get_diag(esp_radar_train_diag_t *diag)
 {
-    float (*csi_data_0)[cols] = (float (*)[cols])s_ctx.csi_data_buff->amplitude[buff_index->begin];
-    float (*csi_data_1)[cols] = (float (*)[cols])s_ctx.csi_data_buff->amplitude[0];
+    if (!s_ctx.default_peer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_radar_train_get_diag_ex((esp_radar_handle_t)s_ctx.default_peer, diag);
+}
 
-    uint16_t csi_data_0_len = (buff_index->begin <= buff_index->end) ? buff_index->window : (s_ctx.window_ctx.buff_size - buff_index->begin);
+static esp_err_t csi_detection_compute_motion_dec(esp_radar_peer_t *peer, uint16_t cols, const csi_data_buff_index_t *buff_index, float *motion_dec_buff_current)
+{
+    if (!peer || !peer->csi_data_buff || !peer->csi_data_buff->amplitude) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    float (*csi_data_0)[cols] = (float (*)[cols])peer->csi_data_buff->amplitude[buff_index->begin];
+    float (*csi_data_1)[cols] = (float (*)[cols])peer->csi_data_buff->amplitude[0];
+
+    uint16_t csi_data_0_len = (buff_index->begin <= buff_index->end) ? buff_index->window : (peer->window_ctx.buff_size - buff_index->begin);
     uint16_t csi_data_1_len = buff_index->window - csi_data_0_len;
 
     if (csi_data_0_len == 0) {
@@ -746,16 +1268,17 @@ static esp_err_t csi_detection_compute_motion_dec(uint16_t cols, const csi_data_
     return esp_radar_motion_dec_compute(cols, csi_data_0_len, csi_data_0, csi_data_1_len, csi_data_1, motion_dec_buff_current);
 }
 
-static void csi_detection_compute_wander(wifi_radar_info_t *radar_info, float *motion_dec_buff_current, uint16_t cols)
+static void csi_detection_compute_wander(esp_radar_peer_t *peer, wifi_radar_info_t *radar_info,
+                                         float *motion_dec_buff_current, uint16_t cols)
 {
-    if (s_radar_calibrate->data_num == 0) {
+    if (!peer || !peer->cal || peer->cal->data_num == 0) {
         radar_info->waveform_wander = 0.0f;
         return;
     }
 
     radar_info->waveform_wander = 1.0f;
-    for (size_t i = 0; i < s_radar_calibrate->data_num && i < CSI_WANDER_NUM; ++i) {
-        float *record = s_radar_calibrate->data[i % CSI_WANDER_NUM];
+    for (size_t i = 0; i < peer->cal->data_num && i < CSI_WANDER_NUM; ++i) {
+        float *record = peer->cal->data[i % CSI_WANDER_NUM];
         if (!record) {
             continue;
         }
@@ -766,87 +1289,127 @@ static void csi_detection_compute_wander(wifi_radar_info_t *radar_info, float *m
     }
 }
 
-static void csi_training_collect_sample(wifi_radar_info_t *radar_info, float **motion_dec_buff, uint16_t cols)
+static void csi_training_collect_sample(esp_radar_peer_t *peer, wifi_radar_info_t *radar_info, float **motion_dec_buff, uint16_t cols)
 {
     uint8_t move_buffer_size = s_ctx.dec_config.dec_window_size;
-
-    size_t idx_first = (s_radar_calibrate->buff_size + RADAR_BUFF_NUM - 2) % RADAR_BUFF_NUM;
-    size_t idx_second = (s_radar_calibrate->buff_size + RADAR_BUFF_NUM - 1) % RADAR_BUFF_NUM;
-    size_t idx_third = s_radar_calibrate->buff_size % RADAR_BUFF_NUM;
-
-    s_radar_calibrate->waveform_jitter_buff[idx_third] = radar_info->waveform_jitter;
-    s_radar_calibrate->buff_size++;
-
-    if (s_radar_calibrate->buff_size < RADAR_BUFF_NUM) {
+    if (!peer || !peer->cal) {
         return;
     }
 
-    float first = s_radar_calibrate->waveform_jitter_buff[idx_first];
-    float second = s_radar_calibrate->waveform_jitter_buff[idx_second];
-    float third = s_radar_calibrate->waveform_jitter_buff[idx_third];
+    size_t idx_first = (peer->cal->buff_size + RADAR_BUFF_NUM - 2) % RADAR_BUFF_NUM;
+    size_t idx_second = (peer->cal->buff_size + RADAR_BUFF_NUM - 1) % RADAR_BUFF_NUM;
+    size_t idx_third = peer->cal->buff_size % RADAR_BUFF_NUM;
+
+    peer->cal->waveform_jitter_buff[idx_third] = radar_info->waveform_jitter;
+    peer->cal->buff_size++;
+
+    if (peer->cal->buff_size < RADAR_BUFF_NUM) {
+        peer->cal->last_action = ESP_RADAR_TRAIN_ACTION_WAIT_BUFFER;
+        return;
+    }
+
+    float first = peer->cal->waveform_jitter_buff[idx_first];
+    float second = peer->cal->waveform_jitter_buff[idx_second];
+    float third = peer->cal->waveform_jitter_buff[idx_third];
 
     if ((first - second > RADAR_OUTLIERS_THRESHOLD) && (third - second > RADAR_OUTLIERS_THRESHOLD)) {
+        peer->cal->last_action = ESP_RADAR_TRAIN_ACTION_DISCARD_OUTLIER;
         ESP_LOGI(TAG_TRAIN, "Jitter outlier detected: %.4f < %.4f, %.4f", second, first, third);
         return;
     }
 
-    if (s_radar_calibrate->static_wander < radar_info->waveform_jitter) {
-        s_radar_calibrate->static_wander = second;
+    if (peer->cal->static_wander < radar_info->waveform_jitter) {
+        peer->cal->static_wander = second;
     }
 
-    if (s_waveform_wander_last > CSI_WANDER_THRESHOLD) {
-        float *motion_dec_prev = motion_dec_buff[(s_motion_dec_buff_num + move_buffer_size - 2) % move_buffer_size];
+    if (peer->waveform_wander_last > CSI_WANDER_THRESHOLD) {
+        float *motion_dec_prev = motion_dec_buff[(peer->motion_dec_buff_num + move_buffer_size - 2) % move_buffer_size];
         if (motion_dec_prev) {
-            size_t index = s_radar_calibrate->data_num % CSI_WANDER_NUM;
+            size_t index = peer->cal->data_num % CSI_WANDER_NUM;
 
-            if (!s_radar_calibrate->data[index]) {
-                s_radar_calibrate->data[index] = RADAR_MALLOC_RETRY((size_t)cols * sizeof(float));
+            if (!peer->cal->data[index]) {
+                peer->cal->data[index] = RADAR_MALLOC_RETRY((size_t)cols * sizeof(float));
             }
 
-            memcpy(s_radar_calibrate->data[index], motion_dec_prev, (size_t)cols * sizeof(float));
-            s_radar_calibrate->data_num++;
-            s_radar_calibrate->none_wander = 0.0f;
+            memcpy(peer->cal->data[index], motion_dec_prev, (size_t)cols * sizeof(float));
+            peer->cal->data_num++;
+            peer->cal->none_wander = 0.0f;
             radar_info->waveform_wander = 0.0f;
+            peer->cal->last_action = ESP_RADAR_TRAIN_ACTION_COLLECT_SAMPLE;
 
             ESP_LOGI(TAG_TRAIN, "Training sample collected: num=%zu, wander=%.4f",
-                     s_radar_calibrate->data_num, s_waveform_wander_last);
+                     peer->cal->data_num, peer->waveform_wander_last);
         }
     } else {
-        s_radar_calibrate->none_wander = s_waveform_wander_last;
-        if (s_waveform_wander_last > 0.00001f) {
-            s_radar_calibrate->none_wander_sum += s_waveform_wander_last;
-            s_radar_calibrate->none_wander_count += 1.0f;
+        peer->cal->last_action = ESP_RADAR_TRAIN_ACTION_ACCUMULATE_BACKGROUND;
+        peer->cal->none_wander = peer->waveform_wander_last;
+        if (peer->waveform_wander_last > 0.00001f) {
+            peer->cal->none_wander_sum += peer->waveform_wander_last;
+            peer->cal->none_wander_count += 1.0f;
 
             ESP_LOGI(TAG_TRAIN, "Training stats: sum=%.4f, count=%.0f, avg=%.4f",
-                     s_radar_calibrate->none_wander_sum, s_radar_calibrate->none_wander_count,
-                     s_radar_calibrate->none_wander_sum / s_radar_calibrate->none_wander_count);
+                     peer->cal->none_wander_sum, peer->cal->none_wander_count,
+                     peer->cal->none_wander_sum / peer->cal->none_wander_count);
         }
     }
 
-    s_waveform_wander_last = radar_info->waveform_wander;
+    peer->waveform_wander_last = radar_info->waveform_wander;
+}
+
+esp_err_t esp_radar_train_get_diag_ex(esp_radar_handle_t handle, esp_radar_train_diag_t *diag)
+{
+    esp_radar_peer_t *peer = (esp_radar_peer_t *)handle;
+    if (!peer || !diag) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!peer->cal) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    memset(diag, 0, sizeof(*diag));
+    diag->status = radar_train_status_to_public(peer->cal->calibrate_status);
+    diag->last_action = peer->cal->last_action;
+    diag->template_sample_count = (uint32_t)peer->cal->data_num;
+    diag->background_stats_count = (uint32_t)peer->cal->none_wander_count;
+    diag->background_stats_sum = peer->cal->none_wander_sum;
+    diag->background_stats_avg = (peer->cal->none_wander_count > 0.0f)
+                                 ? (peer->cal->none_wander_sum / peer->cal->none_wander_count)
+                                 : 0.0f;
+    diag->last_basis_wander = peer->waveform_wander_last;
+    diag->static_jitter_reference = peer->cal->static_wander;
+    diag->thresholds_ready = (peer->cal->calibrate_status == RADAR_CALIBRATE_COMPLETE);
+    return ESP_OK;
 }
 
 static void csi_detection_task(void *arg)
 {
     uint8_t move_buffer_size = s_ctx.dec_config.dec_window_size;
-    float **motion_dec_buff = RADAR_MALLOC_RETRY(move_buffer_size * sizeof(float *));
-    memset(motion_dec_buff, 0, move_buffer_size * sizeof(float *));
     uint16_t cols = 0;
-    bool motion_dec_buff_allocated = false;
-    csi_data_buff_index_t buff_index = {0};
+    csi_window_msg_t msg = {0};
 
-    while (xQueueReceive(s_ctx.csi_data_queue, &buff_index, portMAX_DELAY) && s_ctx.run_flag) {
-        cols = s_ctx.subcarrier_len;
-        if (!s_ctx.csi_data_buff->amplitude || cols == 0) {
+    while (xQueueReceive(s_ctx.csi_data_queue, &msg, portMAX_DELAY)) {
+        esp_radar_peer_t *peer = msg.peer;
+        csi_data_buff_index_t buff_index = msg.index;
+        if (!s_ctx.run_flag) {
+            break;
+        }
+        if (!peer) {
+            continue;
+        }
+        cols = peer->subcarrier_len;
+        if (!peer->csi_data_buff || !peer->csi_data_buff->amplitude || cols == 0) {
             ESP_LOGW(TAG_DETECTION, "CSI buffer not ready");
             continue;
         }
 
-        if (!motion_dec_buff_allocated) {
+        if (!peer->motion_dec_buff_allocated) {
+            peer->motion_dec_buff = RADAR_MALLOC_RETRY(move_buffer_size * sizeof(float *));
+            memset(peer->motion_dec_buff, 0, move_buffer_size * sizeof(float *));
             for (int i = 0; i < move_buffer_size; ++i) {
-                motion_dec_buff[i] = RADAR_MALLOC_RETRY(cols * sizeof(float));
+                peer->motion_dec_buff[i] = RADAR_MALLOC_RETRY(cols * sizeof(float));
             }
-            motion_dec_buff_allocated = true;
+            peer->motion_dec_buff_allocated = true;
+            peer->motion_dec_capacity = move_buffer_size;
             ESP_LOGI(TAG_DETECTION, "Allocated motion detection buffer: %d x %d", move_buffer_size, cols);
         }
 
@@ -857,34 +1420,35 @@ static void csi_detection_task(void *arg)
 
         uint32_t timestamp_start = esp_log_timestamp();
 
-        float *motion_dec_buff_current = motion_dec_buff[s_motion_dec_buff_num % move_buffer_size];
+        float *motion_dec_buff_current = peer->motion_dec_buff[peer->motion_dec_buff_num % move_buffer_size];
 
-        if (csi_detection_compute_motion_dec(cols, &buff_index, motion_dec_buff_current) != ESP_OK) {
-            ESP_LOGD(TAG_DETECTION, "Motion detection calculation failed");
+        if (csi_detection_compute_motion_dec(peer, cols, &buff_index, motion_dec_buff_current) != ESP_OK) {
+            ESP_LOGW(TAG_DETECTION, "Motion detection calculation failed");
             continue;
         }
-        s_motion_dec_buff_num++;
+        peer->motion_dec_buff_num++;
 
-        radar_info.waveform_jitter = esp_radar_motion_dec_compute_jitter(motion_dec_buff_current, motion_dec_buff, cols, s_ctx.dec_config.dec_window_size, s_motion_dec_buff_num);
+        radar_info.waveform_jitter = esp_radar_motion_dec_compute_jitter(
+                                         motion_dec_buff_current, peer->motion_dec_buff, cols, move_buffer_size, peer->motion_dec_buff_num);
 
-        if (s_radar_calibrate) {
-            if (s_radar_calibrate->subcarrier_len == 0) {
-                s_radar_calibrate->subcarrier_len = cols;
-            } else if (s_radar_calibrate->subcarrier_len != cols) {
+        if (peer->cal) {
+            if (peer->cal->subcarrier_len == 0) {
+                peer->cal->subcarrier_len = cols;
+            } else if (peer->cal->subcarrier_len != cols) {
                 ESP_LOGW(TAG_TRAIN, "Subcarrier length changed from %u to %u, reset training data",
-                         s_radar_calibrate->subcarrier_len, cols);
-                esp_radar_train_remove();
-                s_radar_calibrate->subcarrier_len = cols;
+                         peer->cal->subcarrier_len, cols);
+                esp_radar_train_remove_ex(peer);
+                peer->cal->subcarrier_len = cols;
             }
 
-            csi_detection_compute_wander(&radar_info, motion_dec_buff_current, cols);
+            csi_detection_compute_wander(peer, &radar_info, motion_dec_buff_current, cols);
 
-            if (s_radar_calibrate->calibrate_status == RADAR_CALIBRATE_PROGRESS && s_motion_dec_buff_num >= 2) {
-                csi_training_collect_sample(&radar_info, motion_dec_buff, cols);
+            if (peer->cal->calibrate_status == RADAR_CALIBRATE_PROGRESS && peer->motion_dec_buff_num >= 2) {
+                csi_training_collect_sample(peer, &radar_info, peer->motion_dec_buff, cols);
             }
         }
 
-        int32_t time_spent  = s_ctx.csi_data_buff->timestamp[buff_index.end] - s_ctx.csi_data_buff->timestamp[buff_index.begin];
+        int32_t time_spent  = peer->csi_data_buff->timestamp[buff_index.end] - peer->csi_data_buff->timestamp[buff_index.begin];
         if (time_spent > 0) {
             ESP_LOGD(TAG_DETECTION, "det_time: %u/%u, free_heap: %d, wander: %f, jitter: %f, window: %d, begin: %d, end: %d, freq: %dHz",
                      time_spent, esp_log_timestamp() - timestamp_start, esp_get_free_heap_size(),
@@ -892,18 +1456,14 @@ static void csi_detection_task(void *arg)
                      buff_index.begin, buff_index.end, buff_index.window * 1000 / time_spent);
         }
 
-        if (s_ctx.dec_config.wifi_radar_cb) {
+        if (s_ctx.dec_config.wifi_radar_cb_ex) {
+            s_ctx.dec_config.wifi_radar_cb_ex(s_ctx.dec_config.wifi_radar_cb_ex_ctx, peer->mac, &radar_info);
+        }
+        if (s_ctx.dec_config.wifi_radar_cb && peer == s_ctx.default_peer) {
             s_ctx.dec_config.wifi_radar_cb(s_ctx.dec_config.wifi_radar_cb_ctx, &radar_info);
         }
     }
 
-    for (int i = 0; i < move_buffer_size; ++i) {
-        if (motion_dec_buff[i]) {
-            RADAR_FREE(motion_dec_buff[i]);
-        }
-    }
-    RADAR_FREE(motion_dec_buff);
-    s_motion_dec_buff_num = 0;
     ESP_LOGW(TAG_DETECTION, "csi_detection_task  exit");
     xEventGroupSetBits(s_ctx.task_exit_group, CSI_DETECTION_EXIT_BIT);
     vTaskDelete(NULL);
@@ -913,37 +1473,36 @@ esp_err_t esp_radar_start()
     if (s_ctx.run_flag) {
         return ESP_OK;
     }
+    if (!s_ctx.init_flag) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_ctx.run_flag = true;
-    s_csi_seq = 0;
-
-    s_ctx.csi_data_buff = RADAR_MALLOC_RETRY(sizeof(csi_data_buff_t));
-    memset(s_ctx.csi_data_buff, 0, sizeof(csi_data_buff_t));
-
-    s_ctx.csi_info_queue = xQueueCreate(5, sizeof(void *));
-    s_ctx.csi_data_queue = xQueueCreate(1, sizeof(csi_data_buff_index_t));
+    s_ctx.csi_info_queue = xQueueCreate(8, sizeof(csi_info_msg_t));
+    s_ctx.csi_data_queue = xQueueCreate(8, sizeof(csi_window_msg_t));
     s_ctx.task_exit_group  = xEventGroupCreate();
     if (s_ctx.dec_config.csi_handle_time < s_ctx.csi_config.csi_recv_interval * (s_ctx.dec_config.dec_window_size)) {
         ESP_LOGE(TAG, "csi_handle_time is too short, will set to %d", s_ctx.csi_config.csi_recv_interval * (s_ctx.dec_config.dec_window_size));
         s_ctx.dec_config.csi_handle_time = s_ctx.csi_config.csi_recv_interval * (s_ctx.dec_config.dec_window_size);
     }
-    s_ctx.window_ctx.handle_window     = (s_ctx.dec_config.csi_handle_time / s_ctx.csi_config.csi_recv_interval) * 2;
-    s_ctx.window_ctx.buff_size         = (s_ctx.dec_config.csi_handle_time / s_ctx.csi_config.csi_recv_interval) * 2 + 20;
-    s_ctx.window_ctx.window_start_seq  = 0;
-    s_ctx.window_ctx.next_seq          = 0;
-    s_ctx.window_ctx.last_timestamp    = 0;
-    s_ctx.window_ctx.ts_delta_relaxed  = false;
+    s_ctx.handle_window     = (s_ctx.dec_config.csi_handle_time / s_ctx.csi_config.csi_recv_interval) * 2;
+    s_ctx.buff_size         = (s_ctx.dec_config.csi_handle_time / s_ctx.csi_config.csi_recv_interval) * 2 + 20;
 
     ESP_LOGI(TAG, "[%s, %d] csi_recv_interval: %d, csi_handle_time: %d, csi_handle_window: %d, csi_handle_buffer: %d",
              __func__, __LINE__,
              s_ctx.csi_config.csi_recv_interval, s_ctx.dec_config.csi_handle_time,
-             s_ctx.window_ctx.handle_window, s_ctx.window_ctx.buff_size);
+             (int)s_ctx.handle_window, (int)s_ctx.buff_size);
 
-    s_ctx.csi_data_buff->amplitude = NULL;
-    s_ctx.csi_data_buff->timestamp = RADAR_MALLOC_RETRY(s_ctx.window_ctx.buff_size * sizeof(uint32_t));
-    memset(s_ctx.csi_data_buff->timestamp, 0, s_ctx.window_ctx.buff_size * sizeof(uint32_t));
-    s_ctx.csi_data_buff->seq_id = RADAR_MALLOC_RETRY(s_ctx.window_ctx.buff_size * sizeof(uint32_t));
-    memset(s_ctx.csi_data_buff->seq_id, 0, s_ctx.window_ctx.buff_size * sizeof(uint32_t));
+    /* Reset and allocate buffers for all registered peers */
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *p = s_ctx.peers[i];
+        if (!p) {
+            continue;
+        }
+        esp_radar_peer_free_motion_dec_buffers(p);
+        esp_radar_peer_free_ring_buffers(p);
+        esp_radar_peer_ensure_ring_buffers(p);
+    }
 
     xTaskCreate(csi_detection_task, "csi_handle", 3 * 1024, NULL, s_ctx.dec_config.csi_handle_priority, NULL);
     xTaskCreate(csi_preprocessing_task, "csi_combine", 3 * 1024, NULL, s_ctx.dec_config.csi_combine_priority, NULL);
@@ -953,34 +1512,30 @@ esp_err_t esp_radar_start()
 
 esp_err_t esp_radar_stop()
 {
-    csi_data_buff_index_t buff_index = {0};
-    wifi_csi_filtered_info_t *filtered_info = NULL;
+    if (!s_ctx.run_flag) {
+        return ESP_OK;
+    }
+    csi_info_msg_t info_msg = {0};
+    csi_window_msg_t win_msg = {0};
+    csi_info_msg_t info_recv = {0};
+    csi_window_msg_t win_recv = {0};
     s_ctx.run_flag = false;
-    xQueueSend(s_ctx.csi_info_queue, &filtered_info, 0);
-    xQueueSend(s_ctx.csi_data_queue, &buff_index, 0);
+    xQueueSend(s_ctx.csi_info_queue, &info_msg, 0);
+    xQueueSend(s_ctx.csi_data_queue, &win_msg, 0);
 
     xEventGroupWaitBits(s_ctx.task_exit_group, CSI_DETECTION_EXIT_BIT | CSI_PREPROCESSING_EXIT_BIT,
                         pdTRUE, pdTRUE, portMAX_DELAY);
 
     if (s_ctx.csi_info_queue) {
-        while (xQueueReceive(s_ctx.csi_info_queue, &filtered_info, 0)) {
-            if (filtered_info) {
-                RADAR_FREE(filtered_info);
+        while (xQueueReceive(s_ctx.csi_info_queue, &info_recv, 0)) {
+            if (info_recv.filtered_info) {
+                RADAR_FREE(info_recv.filtered_info);
             }
         }
     }
 
     if (s_ctx.csi_data_queue) {
-        while (xQueueReceive(s_ctx.csi_data_queue, &buff_index, 0)) ;
-
-        if (s_ctx.csi_data_buff) {
-            RADAR_FREE(s_ctx.csi_data_buff->amplitude);
-            RADAR_FREE(s_ctx.csi_data_buff->timestamp);
-            RADAR_FREE(s_ctx.csi_data_buff->seq_id);
-            RADAR_FREE(s_ctx.csi_data_buff);
-            s_ctx.csi_data_buff = NULL;
-            s_ctx.subcarrier_len = 0;
-        }
+        while (xQueueReceive(s_ctx.csi_data_queue, &win_recv, 0)) ;
         vQueueDelete(s_ctx.csi_data_queue);
         s_ctx.csi_data_queue = NULL;
     }
@@ -992,7 +1547,18 @@ esp_err_t esp_radar_stop()
 
     vEventGroupDelete(s_ctx.task_exit_group);
     s_ctx.task_exit_group = NULL;
-    s_ctx.init_flag = false;
+
+    /* Free per-peer runtime buffers */
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *p = s_ctx.peers[i];
+        if (!p) {
+            continue;
+        }
+        esp_radar_peer_free_motion_dec_buffers(p);
+        esp_radar_peer_free_ring_buffers(p);
+    }
+    s_ctx.buff_size = 0;
+    s_ctx.handle_window = 0;
     return ESP_OK;
 }
 
@@ -1239,8 +1805,14 @@ esp_err_t esp_radar_change_config(esp_radar_config_t *config)
     if (espnow_config && memcmp(espnow_config, &s_ctx.espnow_config, sizeof(esp_radar_espnow_config_t)) != 0) {
         esp_radar_espnow_init(espnow_config);
     }
-    if (csi_config && memcmp(csi_config, &s_ctx.csi_config, sizeof(esp_radar_csi_config_t)) != 0) {
-        esp_radar_csi_init(csi_config);
+    if (csi_config) {
+        esp_err_t ret = esp_radar_sync_default_peer(csi_config->filter_mac);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (memcmp(csi_config, &s_ctx.csi_config, sizeof(esp_radar_csi_config_t)) != 0) {
+            esp_radar_csi_init(csi_config);
+        }
     }
     if (dec_config && memcmp(dec_config, &s_ctx.dec_config, sizeof(esp_radar_dec_config_t)) != 0) {
         esp_radar_dec_init(dec_config);
@@ -1248,6 +1820,7 @@ esp_err_t esp_radar_change_config(esp_radar_config_t *config)
     if (need_start) {
         esp_radar_start();
     }
+    ESP_LOGW(TAG, "esp_radar_change_config: amplitude_log_enabled=%d", dec_config->amplitude_log_enabled);
     return ESP_OK;
 }
 esp_err_t esp_radar_dec_init(esp_radar_dec_config_t *config)
@@ -1256,10 +1829,10 @@ esp_err_t esp_radar_dec_init(esp_radar_dec_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_ctx.init_flag) {
-        ESP_LOGW(TAG, "esp_radar already initialized");
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGW(TAG, "esp_radar decoder already initialized, updating config");
+    } else {
+        s_ctx.init_flag = true;
     }
-    s_ctx.init_flag = true;
     memcpy(&s_ctx.dec_config, config, sizeof(esp_radar_dec_config_t));
     if (s_ctx.dec_config.dec_window_size < RADAR_MOTION_DEC_WINDOW_DEFAULT) {
         ESP_LOGW(TAG, "dec_window_size < 2, fallback to default: %d", RADAR_MOTION_DEC_WINDOW_DEFAULT);
@@ -1281,16 +1854,39 @@ esp_err_t esp_radar_init(esp_radar_config_t *config)
     esp_radar_espnow_init(&config->espnow_config);
     esp_radar_csi_init(&config->csi_config);
     esp_radar_dec_init(&config->dec_config);
+    /* Create default peer for legacy APIs */
+    if (!s_ctx.default_peer) {
+        esp_err_t ret = esp_radar_sync_default_peer(config->csi_config.filter_mac);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
     return ESP_OK;
 }
 esp_err_t esp_radar_deinit()
 {
-    ESP_ERROR_CHECK(esp_wifi_set_csi(false));
-    if (s_radar_calibrate) {
-        radar_calibrate_free_entries(s_radar_calibrate);
-        RADAR_FREE(s_radar_calibrate);
+    if (s_ctx.run_flag) {
+        esp_radar_stop();
     }
-    s_waveform_wander_last = 1.0f;
+    ESP_ERROR_CHECK(esp_wifi_set_csi(false));
+
+    /* Free all peers */
+    for (size_t i = 0; i < ESP_RADAR_MAX_PEERS; ++i) {
+        esp_radar_peer_t *p = s_ctx.peers[i];
+        if (!p) {
+            continue;
+        }
+        esp_radar_peer_free_motion_dec_buffers(p);
+        esp_radar_peer_free_ring_buffers(p);
+        if (p->cal) {
+            radar_calibrate_free_entries(p->cal);
+            RADAR_FREE(p->cal);
+        }
+        RADAR_FREE(p);
+        s_ctx.peers[i] = NULL;
+    }
+    s_ctx.default_peer = NULL;
+    s_ctx.peer_count = 0;
     memset(&s_ctx, 0, sizeof(s_ctx));
 
     return ESP_OK;

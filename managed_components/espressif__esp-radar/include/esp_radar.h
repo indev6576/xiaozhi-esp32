@@ -225,6 +225,15 @@ typedef struct {
 typedef void (*wifi_radar_cb_t)(void *ctx, const wifi_radar_info_t *info);
 
 /**
+ * @brief The RX callback function of Wi-Fi radar data (extended, with source MAC).
+ *
+ * @param ctx  Context argument, passed to esp_radar_init() or esp_radar_change_config() when registering callback function.
+ * @param mac  Source MAC address of the peer which generated the radar info.
+ * @param info Wi-Fi radar data received. The memory that it points to will be deallocated after callback function returns.
+ */
+typedef void (*wifi_radar_cb_ex_t)(void *ctx, const uint8_t mac[6], const wifi_radar_info_t *info);
+
+/**
  * @brief The RX callback function of Wi-Fi CSI data.
  *
  * @param ctx  Context argument, passed to esp_radar_csi_init() when registering callback function.
@@ -321,6 +330,8 @@ typedef enum {
 typedef struct {
     wifi_radar_cb_t wifi_radar_cb;         /**< Register the callback function of Wi-Fi radar data */
     void *wifi_radar_cb_ctx;               /**< Context argument, passed to callback function of Wi-Fi radar */
+    wifi_radar_cb_ex_t wifi_radar_cb_ex;   /**< Register the callback function of Wi-Fi radar data (extended) */
+    void *wifi_radar_cb_ex_ctx;            /**< Context argument, passed to callback function of Wi-Fi radar (extended) */
     esp_radar_ltf_type_t ltf_type;         /**< LTF type to use for radar analysis */
     uint8_t sub_carrier_step_size;         /**< Sub-carrier step size for CSI data sampling, default: 4 */
     uint8_t outliers_threshold;            /**< CSI outliers threshold for filtering, set to 0 to disable, default: 8 */
@@ -330,6 +341,7 @@ typedef struct {
         uint16_t csi_handle_time;         /**< The time of handling CSI data, unit: ms */
         uint8_t dec_window_size;          /**< Detection sliding window size, default: 4 */
     };
+    bool amplitude_log_enabled;            /**< Apply natural-log compression to CSI amplitude before buffering, default: false */
 } esp_radar_dec_config_t;
 
 #define ESP_RADAR_WIFI_CONFIG_DEFAULT() (esp_radar_wifi_config_t){ \
@@ -399,6 +411,8 @@ typedef struct {
 #define ESP_RADAR_DEC_CONFIG_DEFAULT() (esp_radar_dec_config_t){ \
     .wifi_radar_cb = NULL, \
     .wifi_radar_cb_ctx = NULL, \
+    .wifi_radar_cb_ex = NULL, \
+    .wifi_radar_cb_ex_ctx = NULL, \
     .ltf_type = RADAR_LTF_TYPE_LLTF, \
     .sub_carrier_step_size = 4, \
     .outliers_threshold = 8, \
@@ -406,7 +420,153 @@ typedef struct {
     .csi_combine_priority = configMAX_PRIORITIES - 1, \
     .csi_handle_time = 200, \
     .dec_window_size = 4, \
+    .amplitude_log_enabled = false, \
 }
+
+/**
+ * @brief Radar peer handle type (one peer per source MAC address).
+ *
+ * Notes:
+ * - Radar configuration (WiFi/CSI/decoder) is shared across peers and is managed by esp_radar_init().
+ * - Each peer maintains its own runtime state (ring buffer, PCA buffers, training data, etc.).
+ */
+typedef struct esp_radar_peer esp_radar_peer_t;
+typedef esp_radar_peer_t *esp_radar_handle_t;
+
+/**
+ * @brief Register a new radar peer (identified by source MAC address).
+ *
+ * This API registers a peer for CSI packet dispatching. It does NOT reconfigure WiFi/CSI/decoder.
+ * `esp_radar_init()` must be called before this API.
+ *
+ * Notes:
+ * - **Shared config**: All peers share the same radar configuration set by `esp_radar_init()`.
+ * - **Per-peer state**: Each peer maintains its own runtime state (ring buffer, subcarrier_len, PCA buffers,
+ *   training/calibration data, outlier streak, seq counter, etc.).
+ * - **Wildcard peer**: If `mac` is `FF:FF:FF:FF:FF:FF`, this peer becomes a wildcard receiver.
+ *   In multi-peer mode, exact-match peers take precedence over wildcard.
+ * - **Legacy compatibility**: If you only call `esp_radar_init()` and never register extra peers,
+ *   packet filtering follows the legacy rule of `esp_radar_mac_addr_filter()` (filter_mac/filter_dmac/NULL data).
+ *
+ * Thread-safety:
+ * - Safe to call while radar is running (peers can be added dynamically).
+ *
+ * @param mac        Source MAC address of the peer. Use FF:FF:FF:FF:FF:FF to create a wildcard peer.
+ * @param out_handle Output peer handle.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_INVALID_STATE: Radar not initialized
+ *        - ESP_ERR_NO_MEM: Out of memory
+ *        - ESP_ERR_INVALID_SIZE: Peer table is full
+ *        - ESP_ERR_INVALID_RESPONSE: Peer already exists
+ */
+esp_err_t esp_radar_new_peer(const uint8_t mac[6], esp_radar_handle_t *out_handle);
+
+/**
+ * @brief Unregister a radar peer created by esp_radar_new_peer().
+ *
+ * Notes:
+ * - For safety, this API requires radar to be stopped (`esp_radar_stop()`), to avoid use-after-free
+ *   on in-flight queue messages referencing the peer.
+ * - Deleting the default peer created by esp_radar_init() is not supported.
+ *
+ * @param handle Peer handle.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_INVALID_STATE: Radar is running or handle is default peer
+ */
+esp_err_t esp_radar_del_peer(esp_radar_handle_t handle);
+
+/**
+ * @brief Public training status for radar calibration.
+ */
+typedef enum {
+    ESP_RADAR_TRAIN_STATUS_NONE = 0,      /**< Training is not active and no completed session is retained. */
+    ESP_RADAR_TRAIN_STATUS_PROGRESS,      /**< Training is currently collecting diagnostics/background data. */
+    ESP_RADAR_TRAIN_STATUS_COMPLETE,      /**< Training completed successfully and thresholds are available. */
+} esp_radar_train_status_t;
+
+/**
+ * @brief Latest decision made by the radar training pipeline.
+ */
+typedef enum {
+    ESP_RADAR_TRAIN_ACTION_IDLE = 0,              /**< No recent training action. */
+    ESP_RADAR_TRAIN_ACTION_WAIT_BUFFER,           /**< Waiting for enough jitter history before making a decision. */
+    ESP_RADAR_TRAIN_ACTION_DISCARD_OUTLIER,       /**< Discarded because the jitter triplet looks like an outlier. */
+    ESP_RADAR_TRAIN_ACTION_COLLECT_SAMPLE,        /**< Accepted as a new background template sample. */
+    ESP_RADAR_TRAIN_ACTION_ACCUMULATE_BACKGROUND, /**< Counted as normal background fluctuation statistics. */
+} esp_radar_train_action_t;
+
+/**
+ * @brief Training diagnostics snapshot for one peer.
+ */
+typedef struct {
+    esp_radar_train_status_t status;         /**< Current training status. */
+    esp_radar_train_action_t last_action;    /**< Most recent training decision. */
+    uint32_t template_sample_count;          /**< Number of template-sample collection events in this session. */
+    uint32_t background_stats_count;         /**< Number of background wander values accumulated for threshold averaging. */
+    float background_stats_sum;              /**< Sum of accumulated background wander values. */
+    float background_stats_avg;              /**< Mean of accumulated background wander values. */
+    float last_basis_wander;                 /**< Previous wander value used to decide collect vs accumulate. */
+    float static_jitter_reference;           /**< Current calibrated static jitter reference (`static_wander`). */
+    bool thresholds_ready;                   /**< True when training is complete and thresholds are available. */
+} esp_radar_train_diag_t;
+
+/**
+ * @brief Start radar calibration/training mode for a specific peer.
+ *
+ * @param handle Peer handle.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_INVALID_STATE: Peer not ready
+ */
+esp_err_t esp_radar_train_start_ex(esp_radar_handle_t handle);
+
+/**
+ * @brief Remove all calibration data for a specific peer.
+ *
+ * @param handle Peer handle.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ */
+esp_err_t esp_radar_train_remove_ex(esp_radar_handle_t handle);
+
+/**
+ * @brief Stop calibration and get calculated thresholds for a specific peer.
+ *
+ * Returned values use the same scale as `esp_radar_motion_dec_wander_compute()` /
+ * `esp_radar_motion_dec_compute_jitter()` output: typically in `[0, 1]`, where smaller means
+ * more stability. `wander_threshold` is the mean background `waveform_wander` collected during
+ * training; `jitter_threshold` is the calibrated reference jitter (`static_wander`).
+ *
+ * @param handle Peer handle.
+ * @param wander_threshold Pointer to store the calculated wander threshold. Can be NULL.
+ * @param jitter_threshold Pointer to store the calculated jitter threshold. Can be NULL.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_NOT_SUPPORTED: Calibration not initialized
+ *        - ESP_ERR_INVALID_STATE: No calibration data collected
+ */
+esp_err_t esp_radar_train_stop_ex(esp_radar_handle_t handle, float *wander_threshold, float *jitter_threshold);
+
+/**
+ * @brief Get current training diagnostics for a specific peer.
+ *
+ * This is intended for visualization/debugging while training is in progress.
+ *
+ * @param handle Peer handle.
+ * @param diag   Output diagnostics snapshot.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_NOT_SUPPORTED: Training storage not initialized for the peer
+ */
+esp_err_t esp_radar_train_get_diag_ex(esp_radar_handle_t handle, esp_radar_train_diag_t *diag);
 /**
  * @brief Radar configuration structure
  */
@@ -596,18 +756,46 @@ esp_err_t esp_radar_train_remove(void);
  *
  * This function stops the calibration process and calculates the thresholds
  * for wander (human presence detection) and jitter (human movement detection).
+ * Values match `esp_radar_motion_dec` wander/jitter semantics (`[0, 1]`, smaller = more stable).
  * The calibration status is set to RADAR_CALIBRATE_COMPLETE.
  *
- * @param wander_threshold Pointer to store the calculated wander threshold (1 - average correlation).
- *                         Can be NULL if not needed.
- * @param jitter_threshold Pointer to store the calculated jitter threshold (1 - static correlation).
- *                        Can be NULL if not needed.
+ * @param wander_threshold Pointer to store the mean background wander from training.
+ * @param jitter_threshold Pointer to store the reference jitter (`static_wander`) from training.
  * @return
  *        - ESP_OK: Success
  *        - ESP_ERR_NOT_SUPPORTED: Calibration not initialized
  *        - ESP_ERR_INVALID_STATE: No calibration data collected
  */
 esp_err_t esp_radar_train_stop(float *wander_threshold, float *jitter_threshold);
+
+/**
+ * @brief Get current training diagnostics for the default peer.
+ *
+ * @param diag Output diagnostics snapshot.
+ * @return
+ *        - ESP_OK: Success
+ *        - ESP_ERR_INVALID_ARG: Invalid argument
+ *        - ESP_ERR_INVALID_STATE: Default peer is unavailable
+ *        - ESP_ERR_NOT_SUPPORTED: Training storage not initialized
+ */
+esp_err_t esp_radar_train_get_diag(esp_radar_train_diag_t *diag);
+
+/**
+ * @brief Enable/disable esp-radar logs from this component at runtime
+ *
+ * This API suppresses or restores log output by adjusting ESP-IDF per-tag log levels
+ * used inside esp-radar implementation (e.g. "esp_radar", "csi_detection_task", etc.).
+ * When enabling log output, all esp-radar related tags are updated to the specified level.
+ * When disabling, current tag levels are cached and log output is muted.
+ *
+ * Notes:
+ * - If ESP-IDF is built with CONFIG_LOG_TAG_LEVEL_IMPL_NONE, per-tag control is not available,
+ *   and ESP-IDF will apply this to the global default log level instead.
+ *
+ * @param enable true to enable log output, false to disable log output
+ * @param level target log level for esp-radar related tags when enabling
+ */
+void esp_radar_set_log_output(bool enable, esp_log_level_t level);
 
 #ifdef __cplusplus
 }

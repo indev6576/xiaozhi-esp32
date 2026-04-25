@@ -3,5 +3,5 @@ dependencies:
   idf: '>=4.4.1'
 
   esp-radar:
-    version: '>=0.3.0'
+    version: '>=0.3.3'
     override_path: ../../

@@ -3,7 +3,7 @@ dependencies:
   esp_csi_gain_ctrl:
     version: '>=0.1.3'
   esp_radar_motion_dec:
-    version: '>=0.1.0'
+    version: '>=0.1.1'
   idf: '>=5.4'
 description: This package provides algorithmic functionality for ESP-CSI human movement
   and presence detection for easy integration into products.
@@ -20,4 +20,4 @@ targets:
 - esp32c6
 - esp32c61
 url: https://github.com/espressif/esp-csi/tree/master/esp-radar
-version: 0.3.2
+version: 0.3.4

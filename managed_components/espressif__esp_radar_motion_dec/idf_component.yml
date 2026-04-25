@@ -17,4 +17,4 @@ targets:
 - esp32c6
 - esp32c61
 url: https://github.com/espressif/esp-csi
-version: 0.1.0
+version: 0.1.1

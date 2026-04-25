@@ -18,4 +18,12 @@ This is the first release version for esp-radar component in Espressif Component
 # v0.3.2
 1. Reduce warnings.
 2. Change the default LTF type to LLTF.
-3. Fix threshold exception issue when calling radar_stop.
+3. Fix threshold exception issue when calling `esp_radar_stop()`.
+
+# v0.3.4
+1. Added multi-peer CSI reception and dispatching: CSI packets can be processed per source MAC (peer), with independent runtime states (ring buffer, PCA buffers, training/calibration, and correlation metrics).
+2. Introduced peer-based APIs: `esp_radar_new_peer()` / `esp_radar_del_peer()` to register/unregister CSI peers by source MAC address.
+3. Added extended radar callback `wifi_radar_cb_ex_t` to report radar results along with the peer MAC address.
+4. Preserved legacy behavior by default (when not using the new multi-peer APIs): packet filtering and the legacy callback path still follow the original `filter_mac` / `filter_dmac` rules and default-peer behavior.
+5. Refactored internal data path to support peer-aware queues/tasks while keeping shared radar configuration across peers.
+6. Exposed training diagnostics for visualization and debugging.
