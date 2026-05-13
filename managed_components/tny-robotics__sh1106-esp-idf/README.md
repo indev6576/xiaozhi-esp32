@@ -16,6 +16,11 @@ To install the driver, you can clone the repository and place it in the `compone
 git clone https://github.com/TNY-Robotics/sh1106-esp-idf.git components/sh1106
 ```
 
+Or add it using the `idf.py` tool :
+```bash
+idf.py add-dependency "tny-robotics/sh1106-esp-idf^1.0.0"
+```
+
 ## Usage
 
 The driver exposes a simple header file named `esp_lcd_panel_sh1106.h`, that you can include using :
@@ -131,4 +136,10 @@ This driver is under the MIT Licence.
 
 ## Author
 
-This driver was created by the [TNY Robotics](https://tny-robotics.com) team, for any questions or suggestions, please contact us at [contact@furwaz.com](mailto:contact@furwaz.com).
+This driver was created by the [TNY Robotics](https://tny-robotics.com) team.
+
+For any questions or suggestions, please contact us at [contact@tny-robotics.com](mailto:contact@tny-robotics.com).
+
+### Thanks
+
+Special thank to [@ambiguous-fix](https://github.com/ambiguous-fix) for their contributions to the driver (partial screen updates).

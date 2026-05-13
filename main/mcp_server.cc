@@ -76,6 +76,54 @@ void McpServer::AddCommonTools() {
                 return true;
             });
     }
+    
+    AddTool("self.battery.get_status",
+        "Get the battery status including level, charging state, and voltage.",
+        PropertyList(),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            int level = 0;
+            bool charging = false;
+            bool discharging = false;
+            float voltage = 0.0f;
+            if (board.GetBatteryLevel(level, charging, discharging)) {
+                cJSON* battery = cJSON_CreateObject();
+                cJSON_AddNumberToObject(battery, "level", level);
+                cJSON_AddBoolToObject(battery, "charging", charging);
+                cJSON_AddBoolToObject(battery, "discharging", discharging);
+                return battery;
+            }
+            return false;
+        });
+
+    AddTool("self.sim.get_status",
+        "Get the SIM card status including ICCID, carrier name, and signal strength.",
+        PropertyList(),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            std::string info_json = board.GetSystemInfoJson();
+            if (info_json.empty()) {
+                return false;
+            }
+            cJSON* root = cJSON_Parse(info_json.c_str());
+            if (root == nullptr) {
+                return false;
+            }
+            cJSON* board_info = cJSON_GetObjectItem(root, "board");
+            if (board_info == nullptr || !cJSON_IsObject(board_info)) {
+                cJSON_Delete(root);
+                return false;
+            }
+            cJSON* sim = cJSON_CreateObject();
+            cJSON* iccid_item = cJSON_GetObjectItem(board_info, "iccid");
+            cJSON_AddStringToObject(sim, "iccid", (iccid_item && cJSON_IsString(iccid_item)) ? iccid_item->valuestring : "");
+            cJSON* carrier_item = cJSON_GetObjectItem(board_info, "carrier");
+            cJSON_AddStringToObject(sim, "carrier", (carrier_item && cJSON_IsString(carrier_item)) ? carrier_item->valuestring : "");
+            cJSON* csq_item = cJSON_GetObjectItem(board_info, "csq");
+            cJSON_AddStringToObject(sim, "csq", (csq_item && cJSON_IsString(csq_item)) ? csq_item->valuestring : "");
+            ESP_LOGI(TAG, "Sim status: %s", cJSON_Print(sim));
+            cJSON_Delete(root);
+            return sim;
+        });
+
 
 #ifdef HAVE_LVGL
     auto display = board.GetDisplay();

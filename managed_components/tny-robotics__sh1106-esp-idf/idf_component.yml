@@ -1,8 +1,11 @@
 description: SH1106 ESP-IDF Driver by TNY Robotics
 issues: https://github.com/TNY-Robotics/sh1106-esp-idf/issues
 maintainers:
-- TNY Robotics <contact@furwaz.com>
-repository: https://github.com/TNY-Robotics/sh1106-esp-idf.git
+- TNY Robotics <contact@tny-robotics.com>
+repository: git://github.com/TNY-Robotics/sh1106-esp-idf.git
+repository_info:
+  commit_sha: 6d64458520b071eedb1090563ea47ecbc5a0348f
+  path: .
 tags:
 - sh1106
 - display
@@ -12,4 +15,4 @@ tags:
 - driver
 - esp-idf
 url: https://github.com/TNY-Robotics/sh1106-esp-idf
-version: 1.0.0
+version: 1.0.1
