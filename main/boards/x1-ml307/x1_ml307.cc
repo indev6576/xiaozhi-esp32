@@ -1,5 +1,6 @@
 #include "dual_network_board.h"
-#include "codecs/es8312_audio_codec.h"
+#include "ml307_board.h"
+#include "codecs/es8311_audio_codec.h"
 #include "display/oled_display.h"
 #include "freertos/idf_additions.h"
 #include "protocol.h"
@@ -12,6 +13,7 @@
 #include "led/circular_strip.h"
 #include "assets/lang_config.h"
 
+#include "power_save_timer.h"
 #if CONFIG_USE_CSI_RADAR                                                                                                                                                                                                                                                                   
 #include "wifi_board.h"
 #endif
@@ -23,11 +25,12 @@
 
 #define TAG "X1ML307Board"
 
-class X1ML307Board : public DualNetworkBoard {
+class X1ML307Board : public Ml307Board {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
     Button charge_button;
+    PowerSaveTimer* power_save_timer_;
 
 #if CONFIG_USE_CSI_RADAR
     WifiBoard csi_wifi_board_;
@@ -70,40 +73,40 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
+            // auto& app = Application::GetInstance();
             ESP_LOGI(TAG, "Boot button clicked");
-            if (app.GetInterComStatus())
-            {
-                app.AbortSpeaking(kAbortReasonNone);
-                app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"stop\",\"target\":\"1658\"}");
-                app.SetInterCom(false);
-            }
-            else {
+            // if (app.GetInterComStatus())
+            // {
+            //     app.AbortSpeaking(kAbortReasonNone);
+            //     app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"stop\",\"target\":\"1658\"}");
+            //     app.SetInterCom(false);
+            // }
+            // else {
                 Application::GetInstance().ToggleChatState();
-            }
+            // }
             
         });
         boot_button_.OnLongPress([this]() {
             SwithOnOff(false);
             ESP_LOGI(TAG, "Boot button long pressed");
         });
-        boot_button_.OnDoubleClick([this]() {
-            auto& app = Application::GetInstance();
-            // auto& board = Board::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
-                this->SwitchNetworkType(); 
-            }
-            else { 
-                // 将耗时操作推迟到主循环中执行，避免阻塞按钮中断
-                app.Schedule([]() {
-                    auto& app = Application::GetInstance();
-                    app.AbortSpeaking(kAbortReasonNone);
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"start\",\"target\":\"1658\"}");
-                    app.SetInterCom(true);
-                });
-            }
-        });
+        // boot_button_.OnDoubleClick([this]() {
+        //     auto& app = Application::GetInstance();
+        //     // auto& board = Board::GetInstance();
+        //     if (app.GetDeviceState() == kDeviceStateStarting || app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+        //         this->SwitchNetworkType(); 
+        //     }
+        //     else { 
+        //         // 将耗时操作推迟到主循环中执行，避免阻塞按钮中断
+        //         app.Schedule([]() {
+        //             auto& app = Application::GetInstance();
+        //             app.AbortSpeaking(kAbortReasonNone);
+        //             vTaskDelay(pdMS_TO_TICKS(100));
+        //             app.SendMessage("{\"type\":\"intercom_dev2serv\",\"action\":\"start\",\"target\":\"1658\"}");
+        //             app.SetInterCom(true);
+        //         });
+        //     }
+        // });
 
         charge_button.OnPressDown([this]() {
             auto& app = Application::GetInstance();
@@ -117,13 +120,29 @@ private:
         });
     }
 
+    void InitializePowerSaveTimer() {
+        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_->OnEnterSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(true);
+            ESP_LOGI(TAG, "light sleep");
+        });
+        power_save_timer_->OnExitSleepMode([this]() {
+            GetDisplay()->SetPowerSaveMode(false);
+        });
+        power_save_timer_->OnShutdownRequest([this]() {
+            ESP_LOGI(TAG, "Shutting down");
+            SwithOnOff(false);
+        });
+        power_save_timer_->SetEnabled(true);
+    }
 
 public:
-    X1ML307Board() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true), charge_button(CHARGE_PIN_GPIO){
+    X1ML307Board() : Ml307Board(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC), boot_button_(BOOT_BUTTON_GPIO, true), charge_button(CHARGE_PIN_GPIO){
 
         InitializeCodecI2c();
         InitializeGPIO();
         InitializeButtons();
+        InitializePowerSaveTimer();
 
 #if CONFIG_USE_CSI_RADAR
         ESP_LOGI(TAG, "Starting CSI WiFi board for radar...");
@@ -139,7 +158,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-         static Es8312AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0,
+         static Es8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0,
             AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK,
             AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
             AUDIO_CODEC_ES8311_ADDR, false);
